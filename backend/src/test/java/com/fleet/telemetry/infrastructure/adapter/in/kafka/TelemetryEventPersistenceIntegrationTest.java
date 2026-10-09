@@ -3,8 +3,10 @@ package com.fleet.telemetry.infrastructure.adapter.in.kafka;
 import com.fleet.telemetry.application.usecase.ProcessTelemetryEvent;
 import com.fleet.telemetry.application.usecase.GetVehicleState;
 import com.fleet.telemetry.domain.model.TelemetryEvent;
-import com.fleet.telemetry.infrastructure.adapter.out.persistence.TelemetryEventJpaRepository;
 import com.fleet.telemetry.infrastructure.adapter.out.kafka.KafkaTelemetryEventPublisher;
+import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryEventMessage;
+import com.fleet.telemetry.infrastructure.adapter.out.persistence.TelemetryEventJpaRepository;
+import com.fleet.telemetry.infrastructure.adapter.out.sse.TelemetrySseBroadcaster;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -12,6 +14,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -22,8 +25,12 @@ import java.util.UUID;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 @SpringBootTest(properties = {
 		"spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}",
@@ -59,6 +66,12 @@ class TelemetryEventPersistenceIntegrationTest {
 	@Autowired
 	private GetVehicleState getVehicleState;
 
+	@Autowired
+	private TelemetryEventListener telemetryEventListener;
+
+	@MockitoSpyBean
+	private TelemetrySseBroadcaster telemetrySseBroadcaster;
+
 	@Test
 	void persistsKafkaEventAndDoesNotDuplicateRepeatedEventId() {
 		UUID eventId = UUID.randomUUID();
@@ -70,7 +83,6 @@ class TelemetryEventPersistenceIntegrationTest {
 				Instant.parse("2026-10-09T15:00:00Z"));
 
 		publisher.publish(event);
-		publisher.publish(event);
 
 		await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
 			var persistedEvent = repository.findById(eventId);
@@ -79,6 +91,57 @@ class TelemetryEventPersistenceIntegrationTest {
 			assertEquals(event.timestamp(), persistedEvent.get().getEventTimestamp());
 			assertEquals(1L, repository.count());
 		});
+
+		assertFalse(processTelemetryEvent.execute(event));
+		assertEquals(1L, repository.count());
+	}
+
+	@Test
+	void publishesSseOnlyAfterCommitAndDoesNotRepublishDuplicateEvent() {
+		TelemetryEvent event = new TelemetryEvent(
+				UUID.randomUUID(),
+				"truck-sse-order",
+				40.7128,
+				-74.0060,
+				Instant.parse("2026-10-09T15:00:00Z"));
+		TelemetryEventMessage message = TelemetryEventMessage.from(event);
+
+		doAnswer(invocation -> {
+			assertTrue(repository.findById(event.eventId()).isPresent(),
+					"the event must be committed before the broadcaster is called");
+			return invocation.callRealMethod();
+		}).when(telemetrySseBroadcaster).publish(event);
+
+		telemetryEventListener.consume(message);
+		telemetryEventListener.consume(message);
+
+		verify(telemetrySseBroadcaster, times(1)).publish(event);
+	}
+
+	@Test
+	void conflictingPayloadForExistingEventIdIsIgnoredAndFirstPayloadRemainsStored() {
+		UUID eventId = UUID.randomUUID();
+		TelemetryEvent original = new TelemetryEvent(
+				eventId,
+				"truck-original",
+				40.7128,
+				-74.0060,
+				Instant.parse("2026-10-09T15:00:00Z"));
+		TelemetryEvent conflicting = new TelemetryEvent(
+				eventId,
+				"truck-conflicting",
+				41.0,
+				-75.0,
+				Instant.parse("2026-10-09T16:00:00Z"));
+
+		assertTrue(processTelemetryEvent.execute(original));
+		assertFalse(processTelemetryEvent.execute(conflicting));
+
+		var persisted = repository.findById(eventId).orElseThrow();
+		assertEquals(original.vehicleId(), persisted.getVehicleId());
+		assertEquals(original.latitude(), persisted.getLatitude());
+		assertEquals(original.longitude(), persisted.getLongitude());
+		assertEquals(original.timestamp(), persisted.getEventTimestamp());
 	}
 
 	@Test

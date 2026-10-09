@@ -17,13 +17,13 @@ public class JpaTelemetryEventStore implements TelemetryEventStore, VehicleTelem
 	}
 
 	@Override
-	public void saveIfAbsent(TelemetryEvent event) {
-		repository.insertIfAbsent(
+	public boolean saveIfAbsent(TelemetryEvent event) {
+		return repository.insertIfAbsent(
 				event.eventId(),
 				event.vehicleId(),
 				event.latitude(),
 				event.longitude(),
-				event.timestamp());
+				event.timestamp()) == 1;
 	}
 
 	@Override

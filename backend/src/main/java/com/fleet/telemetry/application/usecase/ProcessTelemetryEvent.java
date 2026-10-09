@@ -15,7 +15,7 @@ public class ProcessTelemetryEvent {
 	}
 
 	@Transactional
-	public void execute(TelemetryEvent event) {
-		eventStore.saveIfAbsent(event);
+	public boolean execute(TelemetryEvent event) {
+		return eventStore.saveIfAbsent(event);
 	}
 }

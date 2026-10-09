@@ -8,7 +8,7 @@ El publicador espera el acuse del broker antes de responder `202 Accepted`. Si K
 
 El adaptador web no depende de Kafka directamente: el caso de uso depende del puerto de publicación y el adaptador Kafka implementa ese puerto. Kafka recibe un listener interno (`kafka:9092`) y uno externo (`localhost:29092`) para permitir tanto la comunicación de Compose como la ejecución local de Spring Boot.
 
-Los eventos recibidos por el consumidor Kafka se guardan en `telemetry_events` en PostgreSQL/TimescaleDB. `event_id` es clave primaria y la inserción usa `ON CONFLICT DO NOTHING`; una entrega repetida no duplica el evento, pero fallos reales de base de datos se propagan al contenedor Kafka. La tabla usa `TIMESTAMPTZ` para conservar el instante UTC. Es una tabla PostgreSQL normal (no hypertable), porque la restricción global por `event_id` no sería válida en una hypertable particionada por tiempo.
+Los eventos recibidos por el consumidor Kafka se guardan en `telemetry_events` en PostgreSQL/TimescaleDB. `event_id` es clave primaria y la inserción usa `ON CONFLICT DO NOTHING`; una entrega repetida no duplica el evento, pero fallos reales de base de datos se propagan al contenedor Kafka. Si un productor reutiliza un `eventId` con contenido distinto, hoy también se ignora silenciosamente el segundo contenido y prevalece el primer registro. Como mejora pendiente, el adaptador de persistencia debería distinguir duplicados idénticos de colisiones de ID comparando el contenido existente; una colisión debería registrarse y tratarse como error no reintentable o enviarse a una dead-letter topic, sin sobrescribir la telemetría original. La tabla usa `TIMESTAMPTZ` para conservar el instante UTC. Es una tabla PostgreSQL normal (no hypertable), porque la restricción global por `event_id` no sería válida en una hypertable particionada por tiempo.
 
 ### Ejecutar localmente
 
@@ -47,6 +47,18 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/api/vehicles/truck-17/
 ```
 
 Los errores HTTP usan `application/problem+json` con la estructura Problem Details (`type`, `title`, `status`, `detail`, `instance`) y un código estable `code`. Las solicitudes mal formadas o inválidas responden `400`; un vehículo sin telemetría usa `VEHICLE_TELEMETRY_NOT_FOUND`; si Kafka no confirma el envío durante el POST, la API responde `503`; los errores inesperados responden `500` con un detalle genérico. Estos errores del POST no reflejan el resultado posterior del consumidor: un `202` solo confirma que Kafka recibió el evento.
+
+### Flujo de telemetría en tiempo real (SSE)
+
+Los clientes pueden abrir `GET /api/telemetry/stream` y mantener la conexión para recibir eventos `telemetry` de nuevas telemetrías después de persistirse correctamente. Cada evento lleva como `id` el `eventId` y como datos el JSON con `eventId`, `vehicleId`, `latitude`, `longitude` y `timestamp`. Los heartbeats SSE se envían cada 15 segundos por defecto (`app.sse.heartbeat-interval-ms`).
+
+Prueba manual desde PowerShell:
+
+```powershell
+curl.exe -N -H "Accept: text/event-stream" http://localhost:8080/api/telemetry/stream
+```
+
+Con esa conexión abierta, envía un nuevo `POST /api/telemetry` con un `eventId` único. La notificación solo se difunde después de que la transacción de inserción termina; las entregas duplicadas no producen un evento SSE nuevo. SSE es una difusión efímera a conexiones activas, no un registro duradero ni una garantía de entrega/reproducción: los clientes que están desconectados no reciben los eventos pasados. Kafka y PostgreSQL siguen siendo los mecanismos de procesamiento y persistencia.
 
 ### Comprobar la persistencia
 

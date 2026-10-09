@@ -3,6 +3,7 @@ package com.fleet.telemetry.infrastructure.adapter.in.web;
 import com.fleet.telemetry.application.usecase.VehicleTelemetryNotFoundException;
 import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryPublicationException;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +19,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
@@ -28,6 +30,14 @@ import java.util.stream.Collectors;
 public class TelemetryExceptionHandler {
 
 	private static final Logger logger = LoggerFactory.getLogger(TelemetryExceptionHandler.class);
+
+	@ExceptionHandler(AsyncRequestNotUsableException.class)
+	public void handleUnusableAsyncResponse(
+			AsyncRequestNotUsableException exception,
+			HttpServletRequest request,
+			HttpServletResponse response) {
+		logger.debug("Async response is no longer usable for {}", request.getRequestURI());
+	}
 
 	@ExceptionHandler(TelemetryPublicationException.class)
 	public ResponseEntity<ProblemDetail> handlePublicationFailure(
