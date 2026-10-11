@@ -1,5 +1,7 @@
 package com.fleet.telemetry.infrastructure.adapter.in.web;
 
+import com.fleet.telemetry.application.usecase.AiProviderUnavailableException;
+import com.fleet.telemetry.application.usecase.AiTelemetryQueryException;
 import com.fleet.telemetry.application.usecase.VehicleTelemetryNotFoundException;
 import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryPublicationException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -7,6 +9,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -30,6 +33,39 @@ import java.util.stream.Collectors;
 public class TelemetryExceptionHandler {
 
 	private static final Logger logger = LoggerFactory.getLogger(TelemetryExceptionHandler.class);
+
+	@ExceptionHandler(AiProviderUnavailableException.class)
+	public ResponseEntity<ProblemDetail> handleAiProviderUnavailable(
+			AiProviderUnavailableException exception,
+			HttpServletRequest request) {
+		logger.warn(
+				"AI provider is unavailable for {} (correlationId={})",
+				request.getRequestURI(),
+				MDC.get(AiRequestCorrelationFilter.CORRELATION_ID_MDC_KEY));
+		return problem(
+				HttpStatus.SERVICE_UNAVAILABLE,
+				"AI_PROVIDER_UNAVAILABLE",
+				"No fue posible completar la consulta con el asistente de IA.",
+				request);
+	}
+
+	@ExceptionHandler(AiTelemetryQueryException.class)
+	public ResponseEntity<ProblemDetail> handleAiTelemetryQueryFailure(
+			AiTelemetryQueryException exception,
+			HttpServletRequest request) {
+		logger.error(
+				"AI telemetry query failed for {} (correlationId={}, cause={})",
+				request.getRequestURI(),
+				MDC.get(AiRequestCorrelationFilter.CORRELATION_ID_MDC_KEY),
+				exception.getCause() == null
+						? "unavailable"
+						: exception.getCause().getClass().getSimpleName());
+		return problem(
+				HttpStatus.SERVICE_UNAVAILABLE,
+				"AI_TELEMETRY_QUERY_UNAVAILABLE",
+				"No fue posible consultar la telemetría solicitada.",
+				request);
+	}
 
 	@ExceptionHandler(AsyncRequestNotUsableException.class)
 	public void handleUnusableAsyncResponse(

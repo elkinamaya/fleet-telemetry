@@ -60,6 +60,63 @@ curl.exe -N -H "Accept: text/event-stream" http://localhost:8080/api/telemetry/s
 
 Con esa conexión abierta, envía un nuevo `POST /api/telemetry` con un `eventId` único. La notificación solo se difunde después de que la transacción de inserción termina; las entregas duplicadas no producen un evento SSE nuevo. SSE es una difusión efímera a conexiones activas, no un registro duradero ni una garantía de entrega/reproducción: los clientes que están desconectados no reciben los eventos pasados. Kafka y PostgreSQL siguen siendo los mecanismos de procesamiento y persistencia.
 
+### Consultar telemetría mediante el agente de IA
+
+`POST /api/ai/chat` recibe una pregunta en español de hasta 2000 caracteres. El agente utiliza únicamente herramientas de solo lectura respaldadas por los casos de uso de la aplicación; no realiza llamadas HTTP internas ni permite consultas SQL generadas por el modelo. La respuesta incluye `answer` y `toolsUsed`. Las herramientas disponibles son:
+
+- `get_vehicle_current_state`: estado más reciente de un vehículo.
+- `count_vehicle_reports`: cantidad de eventos persistidos para un vehículo y un periodo.
+- `get_vehicle_telemetry_history`: página de eventos de telemetría de un periodo o los eventos más recientes.
+- `get_vehicle_period_boundaries`: primera y última telemetría de un vehículo en un periodo.
+
+Las fechas se resuelven en el backend, nunca por el modelo: `today` y `yesterday` son días calendario de `America/Bogota`; `last_hour`, `last_24_hours` y `last_7_days` son periodos móviles hasta el instante actual UTC. Los intervalos consultados incluyen el inicio y excluyen el fin. Para fechas explícitas se acepta ISO-8601 con zona/offset, hora local (interpretada en Bogotá) o fecha `YYYY-MM-DD`; una fecha final sin hora incluye ese día completo. Las consultas históricas usan solo registros persistidos en `telemetry_events`, por lo que los mensajes repetidos de Kafka no incrementan el conteo. Los eventos con igual timestamp se ordenan por `event_id` para una paginación determinista; las páginas se entregan en orden cronológico ascendente y cada timestamp se pasa al modelo como texto ISO-8601 UTC. `period=all` solo permite solicitar una lista paginada de eventos recientes, no un conteo de todo el histórico.
+
+El tamaño máximo de página se configura con `AI_HISTORY_MAX_RESULTS` (predeterminado `100`, rango `1`–`1000`); el offset está acotado a `100000`. El índice `(vehicle_id, event_timestamp, event_id)` soporta estas consultas. Una pregunta sin periodo para conteos, historial o extremos debe solicitar una aclaración; no se interpreta como consulta de todo el histórico.
+
+La integración usa `RestClient` y el endpoint Groq compatible con Chat Completions, sin añadir otra dependencia. La configuración canónica es `GROQ_API_KEY`, `GROQ_MODEL` y `GROQ_BASE_URL`. Los valores predeterminados son `https://api.groq.com/openai/v1` y `openai/gpt-oss-20b`. Para realizar consultas, configura en la sesión de PowerShell:
+
+```powershell
+$env:GROQ_API_KEY = "TU_CLAVE_DE_GROQ"
+$env:GROQ_MODEL = "openai/gpt-oss-20b"
+$env:GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+```
+
+Por compatibilidad, `OPENAI_API_KEY`, `OPENAI_MODEL` y `OPENAI_BASE_URL` se mantienen como aliases heredados: cada variable `GROQ_*` tiene prioridad sobre su alias `OPENAI_*`. Si no se define URL/modelo, se usan los valores predeterminados Groq anteriores. `GROQ_API_KEY` (o el alias heredado) se lee solo desde el entorno, no se registra y no es necesaria para arrancar la aplicación; el log de inicio informa únicamente el host, modelo y si hay una clave configurada. Docker Compose no ejecuta el backend, así que al arrancarlo desde el host debes definir estas variables en la misma sesión de PowerShell. Las pruebas usan claves ficticias/mocks y no requieren credenciales reales. La conexión tiene timeout de 3 segundos y la respuesta de 20 segundos. El agente realiza como máximo dos llamadas al proveedor por pregunta y ejecuta como máximo una invocación de herramienta por turno.
+
+Los esquemas de las herramientas no fuerzan `strict` y permiten omitir los límites `from` y `to` cuando no se consulta un periodo explícito; el backend trata su ausencia como nulo y valida el periodo antes de consultar. Esto evita que Groq rechace llamadas de historial reciente con `tool_use_failed` por omitir esos dos argumentos opcionales. Las respuestas de herramientas en el transcript incluyen `tool_call_id` y `name`, además del rol y el resultado.
+
+Para diagnosticar una conversación sin registrar prompts ni datos del vehículo, cada solicitud devuelve `X-Correlation-ID`. Busca ese valor en los logs `AI provider request started/completed`, `AI tool selected/completed/failed` y en el manejador HTTP. Se registran proveedor, modelo, etapa (`initial request` o `after tool execution`), status HTTP, duración, nombre de herramienta y resultado resumido. Los errores HTTP del proveedor incluyen su código/mensaje sanitizados; no se registran claves ni encabezados de autorización. El inicio de llamada se registra a nivel INFO y las excepciones de validación/consulta con WARN o ERROR según corresponda.
+
+Ejemplo para Postman: método `POST`, URL `http://localhost:8080/api/ai/chat`, `Content-Type: application/json`:
+
+```json
+{
+  "question": "¿Cuál es la última posición conocida del vehículo truck-17?"
+}
+```
+
+La misma forma de solicitud sirve para preguntas históricas, por ejemplo:
+
+```json
+{
+  "question": "¿Cuántas telemetrías persistidas recibió truck-17 ayer?"
+}
+```
+
+```json
+{
+  "question": "Muestra las últimas 5 telemetrías de truck-17."
+}
+```
+
+```json
+{
+  "question": "¿Cuál fue la primera y la última posición de truck-17 entre 2026-10-01 y 2026-10-07?"
+}
+```
+
+Una pregunta sobre un vehículo sin registros devuelve una respuesta explícita indicando que no hay telemetría. Los fallos del proveedor y de la consulta se distinguen con errores Problem Details `AI_PROVIDER_UNAVAILABLE` y `AI_TELEMETRY_QUERY_UNAVAILABLE`. Las pruebas usan dobles y un servidor HTTP simulado; no requieren una API key real.
+
 ### Comprobar la persistencia
 
 Envía una petición válida a `POST /api/telemetry`, después consulta PostgreSQL:

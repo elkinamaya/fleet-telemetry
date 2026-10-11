@@ -1,8 +1,7 @@
 package com.fleet.telemetry.infrastructure.adapter.out.kafka;
 
-import com.fleet.telemetry.application.port.out.TelemetryEventStore;
-import com.fleet.telemetry.application.port.out.VehicleTelemetryQuery;
 import com.fleet.telemetry.domain.model.TelemetryEvent;
+import com.fleet.telemetry.infrastructure.adapter.out.persistence.JpaTelemetryEventStore;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -40,10 +39,7 @@ class KafkaTelemetryEventPublisherIntegrationTest {
 	private EmbeddedKafkaBroker embeddedKafka;
 
 	@MockitoBean
-	private TelemetryEventStore telemetryEventStore;
-
-	@MockitoBean
-	private VehicleTelemetryQuery vehicleTelemetryQuery;
+	private JpaTelemetryEventStore telemetryEventStore;
 
 	@Test
 	void publishesJsonEventWithEventIdAsKafkaKey() {

@@ -5,3 +5,6 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
     longitude DOUBLE PRECISION NOT NULL CHECK (longitude BETWEEN -180 AND 180),
     event_timestamp TIMESTAMPTZ NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_events_vehicle_timestamp_event
+    ON telemetry_events (vehicle_id, event_timestamp, event_id);

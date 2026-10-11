@@ -2,6 +2,7 @@ package com.fleet.telemetry;
 
 import com.fleet.telemetry.application.port.out.TelemetryEventStore;
 import com.fleet.telemetry.application.port.out.VehicleTelemetryQuery;
+import com.fleet.telemetry.application.port.out.VehicleTelemetryHistoryQuery;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -18,6 +19,9 @@ class TelemetryApplicationTests {
 
 	@MockitoBean
 	private VehicleTelemetryQuery vehicleTelemetryQuery;
+
+	@MockitoBean
+	private VehicleTelemetryHistoryQuery vehicleTelemetryHistoryQuery;
 
 	@Test
 	void contextLoads() {
