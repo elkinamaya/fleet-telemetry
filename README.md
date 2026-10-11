@@ -2,13 +2,15 @@
 
 ## Ingesta inicial de telemetría
 
-La primera etapa implementa `POST /api/telemetry`: valida el cuerpo HTTP, construye un evento de dominio inmutable y lo publica como JSON en el tópico Kafka `telemetry.events`. La clave Kafka es el UUID del evento, lo que conserva el orden de las observaciones del mismo evento en una partición.
+`POST /api/telemetry` valida el cuerpo HTTP, construye un evento de dominio inmutable y lo publica como JSON en el tópico Kafka `telemetry.events`. El evento incluye `speed` en km/h cuando el productor la conoce. La clave Kafka es `vehicleId`, para mantener las observaciones de cada vehículo en una misma partición y en su orden de publicación; `eventId` conserva la idempotencia de persistencia.
 
-El publicador espera el acuse del broker antes de responder `202 Accepted`. Si Kafka no confirma la publicación, la API devuelve `503 Service Unavailable`; el cliente puede reintentar el mismo ID. El productor usa `acks=all`, idempotencia de productor y un tiempo máximo de entrega configurado. La validación del cuerpo devuelve `400 Bad Request`. Un reintento HTTP con el mismo ID vuelve a publicar el evento: la idempotencia Kafka cubre reintentos internos del productor, no deduplica peticiones de negocio.
+El publicador espera el acuse del broker antes de responder `202 Accepted`. Si Kafka no confirma la publicación, la API devuelve `503 Service Unavailable`; el cliente puede reintentar el mismo ID. El productor usa `acks=all`, idempotencia de productor y un tiempo máximo de entrega configurado. La validación del cuerpo devuelve `400 Bad Request`. Latitud y longitud son obligatorias; `speed` es opcional para mantener compatibilidad con productores anteriores. Cuando se envía, debe ser finita y no negativa; un valor ausente se conserva como desconocido (`null`) y no se usa para evaluar reglas de velocidad. Un reintento HTTP con el mismo ID vuelve a publicar el evento: la idempotencia Kafka cubre reintentos internos del productor, no deduplica peticiones de negocio.
 
 El adaptador web no depende de Kafka directamente: el caso de uso depende del puerto de publicación y el adaptador Kafka implementa ese puerto. Kafka recibe un listener interno (`kafka:9092`) y uno externo (`localhost:29092`) para permitir tanto la comunicación de Compose como la ejecución local de Spring Boot.
 
 Los eventos recibidos por el consumidor Kafka se guardan en `telemetry_events` en PostgreSQL/TimescaleDB. `event_id` es clave primaria y la inserción usa `ON CONFLICT DO NOTHING`; una entrega repetida no duplica el evento, pero fallos reales de base de datos se propagan al contenedor Kafka. Si un productor reutiliza un `eventId` con contenido distinto, hoy también se ignora silenciosamente el segundo contenido y prevalece el primer registro. Como mejora pendiente, el adaptador de persistencia debería distinguir duplicados idénticos de colisiones de ID comparando el contenido existente; una colisión debería registrarse y tratarse como error no reintentable o enviarse a una dead-letter topic, sin sobrescribir la telemetría original. La tabla usa `TIMESTAMPTZ` para conservar el instante UTC. Es una tabla PostgreSQL normal (no hypertable), porque la restricción global por `event_id` no sería válida en una hypertable particionada por tiempo.
+
+La columna `speed` es nullable para conservar registros históricos. `schema.sql` agrega la columna con `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, por lo que una base existente se actualiza sin recrear la tabla ni perder eventos. La base también rechaza velocidades negativas o no finitas.
 
 ### Ejecutar localmente
 
@@ -28,9 +30,12 @@ Ejemplo de solicitud:
   "vehicleId": "truck-17",
   "latitude": 40.7128,
   "longitude": -74.006,
-  "timestamp": "2026-10-09T15:00:00Z"
+  "timestamp": "2026-10-09T15:00:00Z",
+  "speed": 54.5
 }
 ```
+
+`speed` está expresada en km/h. Los clientes antiguos pueden omitirla; los estados e historiales devuelven `null` cuando no existe una velocidad disponible.
 
 ### Fallos conocidos y alcance pendiente
 
@@ -40,7 +45,7 @@ Ejemplo de solicitud:
 
 ### Consultar el estado actual de un vehículo
 
-`GET /api/vehicles/{vehicleId}/state` devuelve `200 OK` con el ID del evento, vehículo, latitud, longitud y timestamp del evento de telemetría más reciente según `event_timestamp` (no el orden de inserción). Si no hay eventos para el vehículo, devuelve `404 Not Found`.
+`GET /api/vehicles/{vehicleId}/state` devuelve `200 OK` con el ID del evento, vehículo, latitud, longitud, velocidad en km/h (o `null` si no estaba disponible) y timestamp del evento de telemetría más reciente según `event_timestamp` (no el orden de inserción). Los resultados del historial que usa el agente de IA incluyen también `speed`. Si no hay eventos para el vehículo, devuelve `404 Not Found`.
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/api/vehicles/truck-17/state"
@@ -50,7 +55,7 @@ Los errores HTTP usan `application/problem+json` con la estructura Problem Detai
 
 ### Flujo de telemetría en tiempo real (SSE)
 
-Los clientes pueden abrir `GET /api/telemetry/stream` y mantener la conexión para recibir eventos `telemetry` de nuevas telemetrías después de persistirse correctamente. Cada evento lleva como `id` el `eventId` y como datos el JSON con `eventId`, `vehicleId`, `latitude`, `longitude` y `timestamp`. Los heartbeats SSE se envían cada 15 segundos por defecto (`app.sse.heartbeat-interval-ms`).
+Los clientes pueden abrir `GET /api/telemetry/stream` y mantener la conexión para recibir eventos `telemetry` de nuevas telemetrías después de persistirse correctamente. Cada evento lleva como `id` el `eventId` y como datos el JSON con `eventId`, `vehicleId`, `latitude`, `longitude`, `timestamp` y `speed`. Los heartbeats SSE se envían cada 15 segundos por defecto (`app.sse.heartbeat-interval-ms`).
 
 Prueba manual desde PowerShell:
 
@@ -59,6 +64,18 @@ curl.exe -N -H "Accept: text/event-stream" http://localhost:8080/api/telemetry/s
 ```
 
 Con esa conexión abierta, envía un nuevo `POST /api/telemetry` con un `eventId` único. La notificación solo se difunde después de que la transacción de inserción termina; las entregas duplicadas no producen un evento SSE nuevo. SSE es una difusión efímera a conexiones activas, no un registro duradero ni una garantía de entrega/reproducción: los clientes que están desconectados no reciben los eventos pasados. Kafka y PostgreSQL siguen siendo los mecanismos de procesamiento y persistencia.
+
+### Alertas operativas
+
+El centro de alertas usa el estado operativo en memoria del backend; no se guardan alertas ni se mantiene un historial. `GET /api/alerts` devuelve la instantánea de alertas activas conocida por el proceso. El mismo stream SSE publica eventos `alert` con `alertId`, `vehicleId`, `type`, `description`, `detectedAt`, `updatedAt`, `speed` y `status` (`ACTIVE` o `RESOLVED`). El frontend consulta la instantánea al conectar o reconectar y aplica las transiciones SSE en vivo. Una telemetría nueva se muestra además como aviso informativo temporal en pantalla; no se cuenta como alerta activa ni se persiste.
+
+Reglas actuales:
+
+- **Vehículo detenido:** dos muestras consecutivas con velocidad disponible ≤ 3 km/h separadas por más de 20 minutos. El cálculo usa los timestamps de las muestras, no un intervalo fijo. Esta regla confirma que las muestras observadas cumplen el criterio; con solo puntos discretos no prueba que la velocidad se mantuviera baja durante cada instante intermedio. Una velocidad > 3 km/h resuelve la alerta.
+- **Velocidad excesiva:** dos muestras consecutivas > 80 km/h. Una muestra ≤ 80 km/h resuelve la alerta. Los umbrales y duración están centralizados en `VehicleAlertMonitor`.
+- **Sin reportes recientes:** se evalúa cada 30 segundos y se activa cuando han transcurrido al menos 15 minutos desde el timestamp de la última telemetría válida. Una nueva telemetría cronológicamente posterior la resuelve; la regla indica pérdida de comunicación, no detención.
+
+Las condiciones activas y candidatos se mantienen solo en memoria. Se pierden al reiniciar el backend y vuelven a formarse con telemetrías posteriores. Como no existe un listado histórico de vehículos, solo se monitorizan los vehículos conocidos por el proceso desde su inicio; no se presenta como monitorizado un vehículo histórico que no haya sido observado en esa ejecución. Eventos persistidos con timestamps anteriores al último evento operativo conocido se ignoran para cambiar las alertas, aunque se conservan y se difunden como telemetría nueva.
 
 ### Consultar telemetría mediante el agente de IA
 
@@ -159,8 +176,8 @@ npm run build
 ### Integraciones y límites reales
 
 - `GET /api/vehicles/{vehicleId}/state`: consulta el estado persistido más reciente del ID seleccionado/introducido; el `404` se presenta como ausencia de telemetría.
-- `GET /api/telemetry/stream`: escucha eventos SSE llamados `telemetry`, cuyo JSON contiene `eventId`, `vehicleId`, `latitude`, `longitude` y `timestamp`. El navegador reconecta con el comportamiento nativo de `EventSource`; la conexión se cierra al desmontar el dashboard. Los IDs duplicados en la sesión se descartan y una observación con timestamp anterior no reemplaza otra más reciente.
+- `GET /api/telemetry/stream`: escucha eventos SSE llamados `telemetry` y `alert`. `telemetry` contiene `eventId`, `vehicleId`, `latitude`, `longitude`, `timestamp` y `speed` (nullable para compatibilidad); `alert` comunica activación/resolución operativa. El navegador reconecta con el comportamiento nativo de `EventSource` y consulta `GET /api/alerts` al reconectar; la conexión se cierra al desmontar el dashboard. Los IDs de telemetría duplicados en la sesión se descartan y una observación con timestamp anterior no reemplaza otra más reciente.
 - `POST /api/ai/chat`: envía `{ "question": "..." }`, presenta `answer` y `toolsUsed`; `AI_PROVIDER_UNAVAILABLE` muestra un error comprensible y permite reintentar sin afirmar éxito.
 - El mapa usa Leaflet y teselas de OpenStreetMap (sin clave API); necesita conexión a Internet para las teselas y conserva su atribución.
-- El backend no ofrece listado inicial de vehículos ni endpoint/reglas de alertas. El dashboard descubre vehículos mediante SSE desde que se abre la sesión y permite buscar un ID conocido con el endpoint de estado; no puede enumerar telemetría previa sin conocer los IDs. El indicador de alertas queda explícitamente no disponible.
+- El backend no ofrece listado inicial de vehículos. El dashboard descubre vehículos mediante SSE desde que se abre la sesión y permite buscar un ID conocido con el endpoint de estado; no puede enumerar telemetría previa sin conocer los IDs. Las informaciones operativas son volátiles y el centro de control solo muestra las condiciones activas que conoce el backend en memoria.
 - No hay endpoint de salud: el estado de backend se infiere de la conexión SSE y de respuestas correctas a solicitudes de estado; el estado SSE se muestra por separado. La telemetría SSE es efímera y no repone eventos anteriores al conectar.

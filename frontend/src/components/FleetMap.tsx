@@ -76,6 +76,8 @@ export default function FleetMap({
             <strong>{vehicle.vehicleId}</strong>
             <br />
             {vehicle.latitude.toFixed(5)}, {vehicle.longitude.toFixed(5)}
+            <br />
+            {vehicle.speed === null ? 'Velocidad no disponible' : `${vehicle.speed} km/h`}
           </Popup>
         </CircleMarker>
       ))}

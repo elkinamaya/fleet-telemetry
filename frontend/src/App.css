@@ -821,6 +821,116 @@
   line-height: 1.5;
 }
 
+.alerts-list {
+  display: grid;
+  gap: 9px;
+  margin: 0 17px 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.operational-alert {
+  padding: 13px 14px;
+  border: 1px solid rgb(242 184 75 / 25%);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-small);
+  background: rgb(242 184 75 / 6%);
+}
+
+.operational-alert.no_recent_reports {
+  border-color: rgb(102 166 229 / 26%);
+  border-left-color: var(--color-info);
+  background: rgb(102 166 229 / 6%);
+}
+
+.operational-alert strong,
+.operational-alert p,
+.operational-alert time {
+  display: block;
+}
+
+.operational-alert strong {
+  margin-top: 5px;
+  color: var(--text-primary);
+}
+
+.operational-alert p {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-label);
+  line-height: 1.45;
+}
+
+.operational-alert time {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-size-meta);
+}
+
+.alert-type {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--color-warning);
+  font-family: var(--mono);
+  font-size: var(--font-size-meta);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.alert-status {
+  padding: 3px 7px;
+  border: 1px solid currentcolor;
+  border-radius: 999px;
+  font-size: 0.625rem;
+  letter-spacing: 0.05em;
+}
+
+.operational-alert.no_recent_reports .alert-type {
+  color: var(--color-info);
+}
+
+.telemetry-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 17px 10px;
+  padding: 12px 14px;
+  border: 1px solid rgb(0 179 173 / 24%);
+  border-radius: var(--radius-small);
+  color: var(--text-secondary);
+  background: rgb(0 179 173 / 7%);
+}
+
+.telemetry-notice > span {
+  color: var(--color-teal-bright);
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.telemetry-notice p,
+.alerts-error {
+  font-size: var(--font-size-label);
+  line-height: 1.5;
+}
+
+.alerts-error {
+  margin: 0 17px 12px;
+  color: #ffb6ba;
+}
+
+.alerts-error button {
+  margin-left: 5px;
+  padding: 0;
+  border: 0;
+  color: var(--color-teal-bright);
+  background: transparent;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .chat-panel {
   margin-top: 17px;
   overflow: hidden;

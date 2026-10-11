@@ -28,6 +28,9 @@ public class TelemetryEventEntity {
 	@Column(name = "event_timestamp", nullable = false, columnDefinition = "TIMESTAMPTZ")
 	private Instant eventTimestamp;
 
+	@Column
+	private Double speed;
+
 	protected TelemetryEventEntity() {
 	}
 
@@ -36,12 +39,23 @@ public class TelemetryEventEntity {
 			String vehicleId,
 			double latitude,
 			double longitude,
-			Instant eventTimestamp) {
+			Instant eventTimestamp,
+			Double speed) {
 		this.eventId = eventId;
 		this.vehicleId = vehicleId;
 		this.latitude = latitude;
 		this.longitude = longitude;
 		this.eventTimestamp = eventTimestamp;
+		this.speed = speed;
+	}
+
+	public TelemetryEventEntity(
+			UUID eventId,
+			String vehicleId,
+			double latitude,
+			double longitude,
+			Instant eventTimestamp) {
+		this(eventId, vehicleId, latitude, longitude, eventTimestamp, null);
 	}
 
 	public UUID getEventId() {
@@ -62,5 +76,9 @@ public class TelemetryEventEntity {
 
 	public Instant getEventTimestamp() {
 		return eventTimestamp;
+	}
+
+	public Double getSpeed() {
+		return speed;
 	}
 }

@@ -100,8 +100,8 @@ public interface TelemetryEventJpaRepository extends JpaRepository<TelemetryEven
 
 	@Modifying
 	@Query(value = """
-			INSERT INTO telemetry_events (event_id, vehicle_id, latitude, longitude, event_timestamp)
-			VALUES (:eventId, :vehicleId, :latitude, :longitude, :eventTimestamp)
+			INSERT INTO telemetry_events (event_id, vehicle_id, latitude, longitude, event_timestamp, speed)
+			VALUES (:eventId, :vehicleId, :latitude, :longitude, :eventTimestamp, :speed)
 			ON CONFLICT (event_id) DO NOTHING
 			""", nativeQuery = true)
 	int insertIfAbsent(
@@ -109,5 +109,6 @@ public interface TelemetryEventJpaRepository extends JpaRepository<TelemetryEven
 			@Param("vehicleId") String vehicleId,
 			@Param("latitude") double latitude,
 			@Param("longitude") double longitude,
-			@Param("eventTimestamp") Instant eventTimestamp);
+			@Param("eventTimestamp") Instant eventTimestamp,
+			@Param("speed") Double speed);
 }

@@ -1,6 +1,7 @@
 package com.fleet.telemetry.infrastructure.adapter.in.web;
 
 import com.fleet.telemetry.application.usecase.SubmitTelemetryEvent;
+import com.fleet.telemetry.domain.model.TelemetryEvent;
 import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryPublicationException;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -9,6 +10,9 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.mockito.ArgumentCaptor.forClass;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
@@ -39,13 +43,36 @@ class TelemetryControllerTest {
 								  "vehicleId": "truck-17",
 								  "latitude": 40.7128,
 								  "longitude": -74.0060,
-								  "timestamp": "2026-10-09T15:00:00Z"
+								  "timestamp": "2026-10-09T15:00:00Z",
+								  "speed": 54.5
 								}
 								"""))
 				.andExpect(status().isAccepted())
 				.andExpect(content().string(""));
 
-		verify(submitTelemetryEvent).execute(any());
+		var event = forClass(TelemetryEvent.class);
+		verify(submitTelemetryEvent).execute(event.capture());
+		assertEquals(54.5, event.getValue().speed());
+	}
+
+	@Test
+	void acceptsLegacyTelemetryWithoutSpeedAsUnknown() throws Exception {
+		mockMvc.perform(post("/api/telemetry")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{
+								  "eventId": "a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50",
+								  "vehicleId": "truck-17",
+								  "latitude": 40.7128,
+								  "longitude": -74.0060,
+								  "timestamp": "2026-10-09T15:00:00Z"
+								}
+								"""))
+				.andExpect(status().isAccepted());
+
+		var event = forClass(TelemetryEvent.class);
+		verify(submitTelemetryEvent).execute(event.capture());
+		assertEquals(null, event.getValue().speed());
 	}
 
 	@Test
@@ -67,6 +94,60 @@ class TelemetryControllerTest {
 				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
 
 		verifyNoInteractions(submitTelemetryEvent);
+	}
+
+	@Test
+	void rejectsNegativeSpeedWithoutPublishing() throws Exception {
+		mockMvc.perform(post("/api/telemetry")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{
+								  "eventId": "a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50",
+								  "vehicleId": "truck-17",
+								  "latitude": 40.7128,
+								  "longitude": -74.0060,
+								  "timestamp": "2026-10-09T15:00:00Z",
+								  "speed": -1.0
+								}
+								"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+
+		verifyNoInteractions(submitTelemetryEvent);
+	}
+
+	@Test
+	void rejectsInfiniteSpeedWithoutPublishing() throws Exception {
+		mockMvc.perform(post("/api/telemetry")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{
+								  "eventId": "a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50",
+								  "vehicleId": "truck-17",
+								  "latitude": 40.7128,
+								  "longitude": -74.0060,
+								  "timestamp": "2026-10-09T15:00:00Z",
+								  "speed": 1e309
+								}
+								"""))
+				.andExpect(status().isBadRequest());
+
+		verifyNoInteractions(submitTelemetryEvent);
+	}
+
+	@Test
+	void rejectsNanSpeedAtTheRequestValidationBoundary() {
+		TelemetryRequest request = new TelemetryRequest(
+				java.util.UUID.randomUUID(),
+				"truck-17",
+				40.0,
+				-74.0,
+				java.time.Instant.parse("2026-10-09T15:00:00Z"),
+				Double.NaN);
+
+		try (var validatorFactory = jakarta.validation.Validation.buildDefaultValidatorFactory()) {
+			assertFalse(validatorFactory.getValidator().validate(request).isEmpty());
+		}
 	}
 
 	@Test

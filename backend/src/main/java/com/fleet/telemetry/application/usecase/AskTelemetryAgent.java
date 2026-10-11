@@ -354,12 +354,14 @@ public class AskTelemetryAgent {
 	}
 
 	private Map<String, Object> eventData(TelemetryEvent event) {
-		return Map.of(
-				"eventId", event.eventId(),
-				"vehicleId", event.vehicleId(),
-				"latitude", event.latitude(),
-				"longitude", event.longitude(),
-				"timestamp", event.timestamp().toString());
+		Map<String, Object> data = new java.util.LinkedHashMap<>();
+		data.put("eventId", event.eventId());
+		data.put("vehicleId", event.vehicleId());
+		data.put("latitude", event.latitude());
+		data.put("longitude", event.longitude());
+		data.put("timestamp", event.timestamp().toString());
+		data.put("speed", event.speed());
+		return data;
 	}
 
 	private String json(Object value) {

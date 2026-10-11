@@ -1,8 +1,10 @@
 import {
   parseTelemetryEvent,
+  parseVehicleAlert,
   type AiChatResponse,
   type ProblemResponse,
   type TelemetryEvent,
+  type VehicleAlert,
 } from './types'
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '/api').replace(/\/+$/, '')
@@ -51,6 +53,22 @@ export async function getVehicleState(vehicleId: string): Promise<TelemetryEvent
     throw new ApiError('El backend devolvió un estado de vehículo inválido.', 502)
   }
   return event
+}
+
+export async function getActiveAlerts(): Promise<VehicleAlert[]> {
+  const response: unknown = await request<unknown>('/alerts')
+  if (!Array.isArray(response)) {
+    throw new ApiError('El backend devolvió una lista de alertas inválida.', 502)
+  }
+  const alerts: VehicleAlert[] = []
+  for (const value of response) {
+    const alert = parseVehicleAlert(value)
+    if (!alert) {
+      throw new ApiError('El backend devolvió una alerta inválida.', 502)
+    }
+    alerts.push(alert)
+  }
+  return alerts
 }
 
 export async function askAgent(question: string): Promise<AiChatResponse> {

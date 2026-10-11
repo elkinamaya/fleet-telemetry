@@ -25,7 +25,7 @@ public class KafkaTelemetryEventPublisher implements TelemetryEventPublisher {
 	@Override
 	public void publish(TelemetryEvent event) {
 		try {
-			kafkaTemplate.send(topic, event.eventId().toString(), TelemetryEventMessage.from(event)).get();
+			kafkaTemplate.send(topic, event.vehicleId(), TelemetryEventMessage.from(event)).get();
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
 			throw new TelemetryPublicationException("Interrupted while publishing telemetry event", exception);

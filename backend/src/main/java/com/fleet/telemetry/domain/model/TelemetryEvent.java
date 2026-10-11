@@ -8,5 +8,15 @@ public record TelemetryEvent(
 		String vehicleId,
 		double latitude,
 		double longitude,
-		Instant timestamp) {
+		Instant timestamp,
+		Double speed) {
+
+	public TelemetryEvent(
+			UUID eventId,
+			String vehicleId,
+			double latitude,
+			double longitude,
+			Instant timestamp) {
+		this(eventId, vehicleId, latitude, longitude, timestamp, null);
+	}
 }

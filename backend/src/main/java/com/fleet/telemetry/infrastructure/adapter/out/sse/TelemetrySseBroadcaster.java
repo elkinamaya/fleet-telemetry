@@ -1,7 +1,9 @@
 package com.fleet.telemetry.infrastructure.adapter.out.sse;
 
 import com.fleet.telemetry.domain.model.TelemetryEvent;
+import com.fleet.telemetry.domain.model.VehicleAlert;
 import com.fleet.telemetry.infrastructure.adapter.in.web.VehicleStateResponse;
+import com.fleet.telemetry.infrastructure.adapter.in.web.VehicleAlertResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -48,6 +50,14 @@ public class TelemetrySseBroadcaster {
 		emitters.forEach(emitter -> send(emitter, SseEmitter.event()
 				.id(event.eventId().toString())
 				.name("telemetry")
+				.data(response)));
+	}
+
+	public void publishAlert(VehicleAlert alert) {
+		VehicleAlertResponse response = VehicleAlertResponse.from(alert);
+		emitters.forEach(emitter -> send(emitter, SseEmitter.event()
+				.id(alert.alertId() + ":" + alert.updatedAt())
+				.name("alert")
 				.data(response)));
 	}
 

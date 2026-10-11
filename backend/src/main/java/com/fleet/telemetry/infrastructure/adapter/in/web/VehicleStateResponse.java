@@ -10,7 +10,8 @@ public record VehicleStateResponse(
 		String vehicleId,
 		double latitude,
 		double longitude,
-		Instant timestamp) {
+		Instant timestamp,
+		Double speed) {
 
 	public static VehicleStateResponse from(TelemetryEvent event) {
 		return new VehicleStateResponse(
@@ -18,6 +19,7 @@ public record VehicleStateResponse(
 				event.vehicleId(),
 				event.latitude(),
 				event.longitude(),
-				event.timestamp());
+				event.timestamp(),
+				event.speed());
 	}
 }

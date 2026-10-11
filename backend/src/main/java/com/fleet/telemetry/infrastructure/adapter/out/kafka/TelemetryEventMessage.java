@@ -10,7 +10,17 @@ public record TelemetryEventMessage(
 		String vehicleId,
 		double latitude,
 		double longitude,
-		String timestamp) {
+		String timestamp,
+		Double speed) {
+
+	public TelemetryEventMessage(
+			UUID eventId,
+			String vehicleId,
+			double latitude,
+			double longitude,
+			String timestamp) {
+		this(eventId, vehicleId, latitude, longitude, timestamp, null);
+	}
 
 	public static TelemetryEventMessage from(TelemetryEvent event) {
 		return new TelemetryEventMessage(
@@ -18,10 +28,12 @@ public record TelemetryEventMessage(
 				event.vehicleId(),
 				event.latitude(),
 				event.longitude(),
-				event.timestamp().toString());
+				event.timestamp().toString(),
+				event.speed());
 	}
 
 	public TelemetryEvent toEvent() {
-		return new TelemetryEvent(eventId, vehicleId, latitude, longitude, Instant.parse(timestamp));
+		return new TelemetryEvent(
+				eventId, vehicleId, latitude, longitude, Instant.parse(timestamp), speed);
 	}
 }

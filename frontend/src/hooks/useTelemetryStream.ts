@@ -1,20 +1,31 @@
 import { useEffect, useRef, useState } from 'react'
 import { getTelemetryStreamUrl } from '../api/client'
-import { parseTelemetryEvent, type TelemetryEvent } from '../api/types'
+import {
+  parseTelemetryEvent,
+  parseVehicleAlert,
+  type TelemetryEvent,
+  type VehicleAlert,
+} from '../api/types'
 
 export type StreamStatus = 'connecting' | 'connected' | 'reconnecting'
 
 export function useTelemetryStream(
   onTelemetry: (event: TelemetryEvent) => void,
+  onAlert: (alert: VehicleAlert) => void,
   onStatusChange: (status: StreamStatus) => void,
 ): StreamStatus {
   const [status, setStatus] = useState<StreamStatus>('connecting')
   const onTelemetryRef = useRef(onTelemetry)
+  const onAlertRef = useRef(onAlert)
   const onStatusChangeRef = useRef(onStatusChange)
 
   useEffect(() => {
     onTelemetryRef.current = onTelemetry
   }, [onTelemetry])
+
+  useEffect(() => {
+    onAlertRef.current = onAlert
+  }, [onAlert])
 
   useEffect(() => {
     onStatusChangeRef.current = onStatusChange
@@ -57,6 +68,21 @@ export function useTelemetryStream(
         if (oldestEventId) seenEventIds.delete(oldestEventId)
       }
       if (active) onTelemetryRef.current(event)
+    })
+    source.addEventListener('alert', (message: MessageEvent<string>) => {
+      let decoded: unknown
+      try {
+        decoded = JSON.parse(message.data)
+      } catch {
+        if (active) console.warn('SSE alert event contained invalid JSON')
+        return
+      }
+      const alert = parseVehicleAlert(decoded)
+      if (!alert) {
+        if (active) console.warn('SSE alert event did not match the expected contract')
+        return
+      }
+      if (active) onAlertRef.current(alert)
     })
 
     return () => {

@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useState, type FormEvent } from 'react'
-import { ApiError, getVehicleState } from './api/client'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { ApiError, getActiveAlerts, getVehicleState } from './api/client'
 import {
   hasValidCoordinates,
   type BackendConnection,
   type TelemetryEvent,
+  type VehicleAlert,
 } from './api/types'
 import AgentChat from './components/AgentChat'
 import FleetMap from './components/FleetMap'
@@ -32,6 +33,12 @@ function App() {
   const [lookupLoading, setLookupLoading] = useState(false)
   const [lookupError, setLookupError] = useState<string | null>(null)
   const [backendConnection, setBackendConnection] = useState<BackendConnection>('unknown')
+  const [alertsById, setAlertsById] = useState<Record<string, VehicleAlert>>({})
+  const [alertsLoaded, setAlertsLoaded] = useState(false)
+  const [alertsError, setAlertsError] = useState<string | null>(null)
+  const [telemetryNotice, setTelemetryNotice] = useState<string | null>(null)
+  const alertRevision = useRef(0)
+  const alertChanges = useRef<Array<{ revision: number; alert: VehicleAlert }>>([])
 
   const handleTelemetry = useCallback((event: TelemetryEvent) => {
     setVehiclesById((current) => {
@@ -41,18 +48,75 @@ function App() {
     })
     setBackendConnection('connected')
     setSelectedVehicleId((current) => current ?? event.vehicleId)
+    setTelemetryNotice(
+      `${event.vehicleId} reportó telemetría a las ${formatTimestamp(event.timestamp)}.`,
+    )
+  }, [])
+
+  const handleAlert = useCallback((alert: VehicleAlert) => {
+    const revision = ++alertRevision.current
+    alertChanges.current.push({ revision, alert })
+    if (alertChanges.current.length > 1000) alertChanges.current.shift()
+    setAlertsById((current) => {
+      const existing = current[alert.alertId]
+      if (existing) {
+        const existingUpdate = Date.parse(existing.updatedAt)
+        const incomingUpdate = Date.parse(alert.updatedAt)
+        if (existingUpdate > incomingUpdate ||
+            (existingUpdate === incomingUpdate && existing.status === alert.status)) {
+          return current
+        }
+      }
+      if (alert.status === 'RESOLVED') {
+        const active = { ...current }
+        delete active[alert.alertId]
+        return active
+      }
+      return { ...current, [alert.alertId]: alert }
+    })
+  }, [])
+
+  const refreshAlerts = useCallback(async () => {
+    const revisionAtRequestStart = alertRevision.current
+    try {
+      const alerts = await getActiveAlerts()
+      setAlertsById(() => {
+        const reconciled = Object.fromEntries(alerts.map((alert) => [alert.alertId, alert]))
+        for (const change of alertChanges.current) {
+          if (change.revision <= revisionAtRequestStart) continue
+          if (change.alert.status === 'RESOLVED') {
+            delete reconciled[change.alert.alertId]
+          } else {
+            reconciled[change.alert.alertId] = change.alert
+          }
+        }
+        return reconciled
+      })
+      setAlertsError(null)
+      setAlertsLoaded(true)
+    } catch {
+      setAlertsError('No fue posible consultar las alertas activas.')
+      setAlertsLoaded(true)
+    }
   }, [])
 
   const handleStreamStatus = useCallback((status: StreamStatus) => {
     setBackendConnection(status === 'connected' ? 'connected' : 'disconnected')
-  }, [])
-  const streamStatus = useTelemetryStream(handleTelemetry, handleStreamStatus)
+    if (status === 'connected') void refreshAlerts()
+  }, [refreshAlerts])
+  const streamStatus = useTelemetryStream(handleTelemetry, handleAlert, handleStreamStatus)
+  useEffect(() => {
+    if (!telemetryNotice) return
+    const timeout = window.setTimeout(() => setTelemetryNotice(null), 6000)
+    return () => window.clearTimeout(timeout)
+  }, [telemetryNotice])
   const vehicles = useMemo(
     () => Object.values(vehiclesById).sort((left, right) => left.vehicleId.localeCompare(right.vehicleId)),
     [vehiclesById],
   )
   const selectedVehicle = selectedVehicleId ? vehiclesById[selectedVehicleId] : undefined
   const positionedCount = vehicles.filter(hasValidCoordinates).length
+  const activeAlerts = Object.values(alertsById).filter((alert) => alert.status === 'ACTIVE')
 
   async function findVehicle(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -229,6 +293,10 @@ function App() {
                   <span>Longitud</span>
                   <strong>{hasValidCoordinates(selectedVehicle) ? selectedVehicle.longitude.toFixed(6) : 'No disponible'}</strong>
                 </div>
+                <div className="detail-row">
+                  <span>Velocidad</span>
+                  <strong>{selectedVehicle.speed === null ? 'No disponible' : `${selectedVehicle.speed} km/h`}</strong>
+                </div>
                 <div className="detail-row timestamp-row">
                   <span>Último evento</span>
                   <strong>{formatTimestamp(selectedVehicle.timestamp)}</strong>
@@ -252,15 +320,49 @@ function App() {
           <section className="panel alerts-panel" aria-labelledby="alerts-heading">
             <div className="panel-heading">
               <div>
-                <span className="eyebrow">CENTRO DE ALERTAS</span>
-                <h2 id="alerts-heading">Alertas operativas</h2>
+                <span className="eyebrow">CENTRO DE CONTROL</span>
+                <h2 id="alerts-heading">Información operativa</h2>
               </div>
-              <span className="muted-count">—</span>
+              <span className="muted-count">{activeAlerts.length}</span>
             </div>
-            <div className="alerts-unavailable">
-              <span aria-hidden="true">◇</span>
-              <p>El backend aún no expone alertas ni reglas operativas.</p>
-            </div>
+            {telemetryNotice && (
+              <div className="telemetry-notice" role="status">
+                <span aria-hidden="true">i</span>
+                <p>{telemetryNotice}</p>
+              </div>
+            )}
+            {alertsError && (
+              <p className="alerts-error" role="alert">
+                {alertsError}{' '}
+                <button type="button" onClick={() => void refreshAlerts()}>Reintentar</button>
+              </p>
+            )}
+            {activeAlerts.length > 0 ? (
+              <ul className="alerts-list">
+                {activeAlerts.map((alert) => (
+                  <li className={`operational-alert ${alert.type.toLowerCase()}`} key={alert.alertId}>
+                    <div className="alert-type">
+                      {alert.type === 'SPEEDING'
+                        ? 'Velocidad excesiva'
+                        : alert.type === 'STOPPED'
+                          ? 'Vehículo detenido'
+                          : 'Sin reportes recientes'}
+                      <span className="alert-status">Activa</span>
+                    </div>
+                    <strong>{alert.vehicleId}</strong>
+                    <p>{alert.description}</p>
+                    <time dateTime={alert.detectedAt}>{formatTimestamp(alert.detectedAt)}</time>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              !alertsError && (
+                <div className="alerts-unavailable">
+                  <span aria-hidden="true">◇</span>
+                  <p>{alertsLoaded ? 'No hay información operativa para mostrar.' : 'Cargando información operativa…'}</p>
+                </div>
+              )
+            )}
           </section>
         </aside>
       </div>
