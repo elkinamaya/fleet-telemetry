@@ -130,3 +130,37 @@ Para ejecutar las pruebas del backend, incluida la integración de consumidor co
 ```powershell
 .\backend\mvnw.cmd -f backend\pom.xml test
 ```
+
+## Dashboard web
+
+El dashboard React/TypeScript consume el backend existente; no genera vehículos, coordenadas ni alertas de demostración.
+
+### Requisitos e inicio
+
+Se requiere Node.js `^20.19.0` o `>=22.12.0` (requisito de Vite 8) y npm. En una terminal, inicia la infraestructura y el backend siguiendo los pasos anteriores. En otra terminal PowerShell:
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+Abre la URL local que muestra Vite (por defecto `http://localhost:5173`). El proxy de desarrollo de Vite reenvía `/api` a `http://localhost:8080`, por lo que el backend local no requiere configuración CORS para este modo. `frontend/.env.example` documenta `VITE_API_BASE_URL`; su valor predeterminado `/api` sirve para el proxy y para despliegues detrás de un proxy same-origin. Si se configura una URL completa para otra API, debe incluir la ruta `/api` y ese backend debe permitir el origen del navegador mediante CORS. No configures secretos en variables `VITE_*`.
+
+Comandos desde `frontend`:
+
+```powershell
+npm run dev
+npm test
+npm run lint
+npm run build
+```
+
+### Integraciones y límites reales
+
+- `GET /api/vehicles/{vehicleId}/state`: consulta el estado persistido más reciente del ID seleccionado/introducido; el `404` se presenta como ausencia de telemetría.
+- `GET /api/telemetry/stream`: escucha eventos SSE llamados `telemetry`, cuyo JSON contiene `eventId`, `vehicleId`, `latitude`, `longitude` y `timestamp`. El navegador reconecta con el comportamiento nativo de `EventSource`; la conexión se cierra al desmontar el dashboard. Los IDs duplicados en la sesión se descartan y una observación con timestamp anterior no reemplaza otra más reciente.
+- `POST /api/ai/chat`: envía `{ "question": "..." }`, presenta `answer` y `toolsUsed`; `AI_PROVIDER_UNAVAILABLE` muestra un error comprensible y permite reintentar sin afirmar éxito.
+- El mapa usa Leaflet y teselas de OpenStreetMap (sin clave API); necesita conexión a Internet para las teselas y conserva su atribución.
+- El backend no ofrece listado inicial de vehículos ni endpoint/reglas de alertas. El dashboard descubre vehículos mediante SSE desde que se abre la sesión y permite buscar un ID conocido con el endpoint de estado; no puede enumerar telemetría previa sin conocer los IDs. El indicador de alertas queda explícitamente no disponible.
+- No hay endpoint de salud: el estado de backend se infiere de la conexión SSE y de respuestas correctas a solicitudes de estado; el estado SSE se muestra por separado. La telemetría SSE es efímera y no repone eventos anteriores al conectar.
