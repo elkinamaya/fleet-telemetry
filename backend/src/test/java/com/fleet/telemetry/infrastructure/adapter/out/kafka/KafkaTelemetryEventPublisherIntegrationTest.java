@@ -1,6 +1,7 @@
 package com.fleet.telemetry.infrastructure.adapter.out.kafka;
 
 import com.fleet.telemetry.domain.model.TelemetryEvent;
+import com.fleet.telemetry.infrastructure.adapter.out.persistence.JpaTelemetryEventStore;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -11,6 +12,7 @@ import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.kafka.test.utils.KafkaTestUtils;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -22,7 +24,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @SpringBootTest(properties = {
 		"spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}",
-		"app.kafka.telemetry-topic=telemetry.events"
+		"app.kafka.telemetry-topic=telemetry.events",
+		"spring.autoconfigure.exclude=org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration,"
+				+ "org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfiguration",
+		"spring.kafka.listener.auto-startup=false"
 })
 @EmbeddedKafka(partitions = 1, topics = "telemetry.events")
 class KafkaTelemetryEventPublisherIntegrationTest {
@@ -32,6 +37,9 @@ class KafkaTelemetryEventPublisherIntegrationTest {
 
 	@Autowired
 	private EmbeddedKafkaBroker embeddedKafka;
+
+	@MockitoBean
+	private JpaTelemetryEventStore telemetryEventStore;
 
 	@Test
 	void publishesJsonEventWithEventIdAsKafkaKey() {

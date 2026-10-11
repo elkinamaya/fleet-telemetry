@@ -2,6 +2,7 @@ package com.fleet.telemetry.infrastructure.adapter.out.kafka;
 
 import com.fleet.telemetry.domain.model.TelemetryEvent;
 
+import java.time.Instant;
 import java.util.UUID;
 
 public record TelemetryEventMessage(
@@ -18,5 +19,9 @@ public record TelemetryEventMessage(
 				event.latitude(),
 				event.longitude(),
 				event.timestamp().toString());
+	}
+
+	public TelemetryEvent toEvent() {
+		return new TelemetryEvent(eventId, vehicleId, latitude, longitude, Instant.parse(timestamp));
 	}
 }
