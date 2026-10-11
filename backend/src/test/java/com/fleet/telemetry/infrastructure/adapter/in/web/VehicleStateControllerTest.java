@@ -37,7 +37,8 @@ class VehicleStateControllerTest {
 				"truck-17",
 				40.7128,
 				-74.0060,
-				Instant.parse("2026-10-09T15:00:00Z")));
+				Instant.parse("2026-10-09T15:00:00Z"),
+				63.5));
 
 		mockMvc.perform(get("/api/vehicles/truck-17/state"))
 				.andExpect(status().isOk())
@@ -45,7 +46,8 @@ class VehicleStateControllerTest {
 				.andExpect(jsonPath("$.vehicleId").value("truck-17"))
 				.andExpect(jsonPath("$.latitude").value(40.7128))
 				.andExpect(jsonPath("$.longitude").value(-74.0060))
-				.andExpect(jsonPath("$.timestamp").value("2026-10-09T15:00:00Z"));
+				.andExpect(jsonPath("$.timestamp").value("2026-10-09T15:00:00Z"))
+				.andExpect(jsonPath("$.speed").value(63.5));
 
 		verify(getVehicleState).execute("truck-17");
 	}

@@ -1,6 +1,8 @@
 package com.fleet.telemetry.infrastructure.adapter.out.sse;
 
 import com.fleet.telemetry.domain.model.TelemetryEvent;
+import com.fleet.telemetry.domain.model.VehicleAlert;
+import com.fleet.telemetry.infrastructure.adapter.in.web.VehicleAlertResponse;
 import com.fleet.telemetry.infrastructure.adapter.in.web.VehicleStateResponse;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
@@ -42,6 +44,7 @@ class TelemetrySseBroadcasterTest {
 		assertEquals(1, broadcaster.connectionCount());
 		assertEquals(2, sentEvents.getAllValues().size());
 		assertEquals(firstEvent.eventId(), responseFrom(sentEvents.getAllValues().get(0)).eventId());
+		assertEquals(42.5, responseFrom(sentEvents.getAllValues().get(0)).speed());
 		assertEquals("truck-18", responseFrom(sentEvents.getAllValues().get(1)).vehicleId());
 	}
 
@@ -59,6 +62,37 @@ class TelemetrySseBroadcasterTest {
 		verify(firstClient, times(2)).send(any(SseEmitter.SseEventBuilder.class));
 		verify(secondClient, times(2)).send(any(SseEmitter.SseEventBuilder.class));
 		assertEquals(2, broadcaster.connectionCount());
+	}
+
+	@Test
+	void publishesOperationalAlertEventsToConnectedClients() throws IOException {
+		TelemetrySseBroadcaster broadcaster = new TelemetrySseBroadcaster();
+		SseEmitter emitter = mock(SseEmitter.class);
+		broadcaster.register(emitter);
+		var sentEvent = forClass(SseEmitter.SseEventBuilder.class);
+		Instant now = Instant.parse("2026-10-11T12:30:00Z");
+		VehicleAlert alert = new VehicleAlert(
+				UUID.randomUUID(),
+				"truck-17",
+				VehicleAlert.Type.SPEEDING,
+				"Velocidad excesiva.",
+				now,
+				now,
+				85.0,
+				VehicleAlert.Status.ACTIVE);
+
+		broadcaster.publishAlert(alert);
+
+		verify(emitter).send(sentEvent.capture());
+		Set<ResponseBodyEmitter.DataWithMediaType> data = sentEvent.getValue().build();
+		VehicleAlertResponse response = data.stream()
+				.map(ResponseBodyEmitter.DataWithMediaType::getData)
+				.filter(VehicleAlertResponse.class::isInstance)
+				.map(VehicleAlertResponse.class::cast)
+				.findFirst()
+				.orElseThrow();
+		assertEquals(alert.alertId(), response.alertId());
+		assertEquals(VehicleAlert.Status.ACTIVE, response.status());
 	}
 
 	@Test
@@ -162,7 +196,8 @@ class TelemetrySseBroadcasterTest {
 				vehicleId,
 				40.7128,
 				-74.0060,
-				Instant.parse("2026-10-09T15:00:00Z"));
+				Instant.parse("2026-10-09T15:00:00Z"),
+				42.5);
 	}
 
 	private VehicleStateResponse responseFrom(SseEmitter.SseEventBuilder event) {

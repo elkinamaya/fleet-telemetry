@@ -117,7 +117,13 @@ class AskTelemetryAgentTest {
 
 	@Test
 	void latestHistoryQuestionAllowsOmittedOptionalFromAndToArguments() {
-		TelemetryEvent oldest = event("truck-17", "2026-10-09T10:00:00Z");
+		TelemetryEvent oldest = new TelemetryEvent(
+				UUID.randomUUID(),
+				"truck-17",
+				40.7128,
+				-74.0060,
+				Instant.parse("2026-10-09T10:00:00Z"),
+				65.0);
 		TelemetryEvent middle = event("truck-17", "2026-10-09T11:00:00Z");
 		TelemetryEvent newest = event("truck-17", "2026-10-09T12:00:00Z");
 		when(client.complete(anyList(), anyList()))
@@ -137,6 +143,7 @@ class AskTelemetryAgentTest {
 		verify(client, org.mockito.Mockito.times(2)).complete(messages.capture(), anyList());
 		String toolResult = messages.getAllValues().getLast().getLast().content();
 		assertTrue(toolResult.contains("\"timestamp\":\"2026-10-09T10:00:00Z\""));
+		assertTrue(toolResult.contains("\"speed\":65.0"));
 		assertTrue(toolResult.contains("\"timestamp\":\"2026-10-09T11:00:00Z\""));
 		assertTrue(toolResult.contains("\"timestamp\":\"2026-10-09T12:00:00Z\""));
 		assertTrue(toolResult.indexOf("2026-10-09T10:00:00Z")

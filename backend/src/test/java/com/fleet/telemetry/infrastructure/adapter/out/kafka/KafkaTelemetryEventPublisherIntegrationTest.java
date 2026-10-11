@@ -42,9 +42,10 @@ class KafkaTelemetryEventPublisherIntegrationTest {
 	private JpaTelemetryEventStore telemetryEventStore;
 
 	@Test
-	void publishesJsonEventWithEventIdAsKafkaKey() {
+	void publishesJsonEventWithVehicleIdAsKafkaKey() {
 		TelemetryEvent event = new TelemetryEvent(
-				UUID.randomUUID(), "truck-17", 40.7128, -74.0060, Instant.parse("2026-10-09T15:00:00Z"));
+				UUID.randomUUID(), "truck-17", 40.7128, -74.0060,
+				Instant.parse("2026-10-09T15:00:00Z"), 62.5);
 		Map<String, Object> consumerProperties = KafkaTestUtils.consumerProps("telemetry-test", "true", embeddedKafka);
 
 		try (Consumer<String, String> consumer = new DefaultKafkaConsumerFactory<>(
@@ -55,9 +56,10 @@ class KafkaTelemetryEventPublisherIntegrationTest {
 
 			ConsumerRecord<String, String> record = KafkaTestUtils.getSingleRecord(
 					consumer, "telemetry.events", Duration.ofSeconds(10));
-			assertEquals(event.eventId().toString(), record.key());
+			assertEquals(event.vehicleId(), record.key());
 			assertTrue(record.value().contains("\"vehicleId\":\"truck-17\""));
 			assertTrue(record.value().contains("\"timestamp\":\"2026-10-09T15:00:00Z\""));
+			assertTrue(record.value().contains("\"speed\":62.5"));
 		}
 	}
 }

@@ -101,7 +101,8 @@ class TelemetryEventPersistenceIntegrationTest {
 				"truck-17",
 				40.7128,
 				-74.0060,
-				Instant.parse("2026-10-09T15:00:00Z"));
+				Instant.parse("2026-10-09T15:00:00Z"),
+				56.5);
 
 		publisher.publish(event);
 
@@ -110,11 +111,13 @@ class TelemetryEventPersistenceIntegrationTest {
 			assertTrue(persistedEvent.isPresent());
 			assertEquals("truck-17", persistedEvent.get().getVehicleId());
 			assertEquals(event.timestamp(), persistedEvent.get().getEventTimestamp());
+			assertEquals(event.speed(), persistedEvent.get().getSpeed());
 			assertEquals(1L, repository.count());
 		});
 
 		assertFalse(processTelemetryEvent.execute(event));
 		assertEquals(1L, repository.count());
+		assertEquals(56.5, getVehicleState.execute("truck-17").speed());
 	}
 
 	@Test
@@ -174,6 +177,21 @@ class TelemetryEventPersistenceIntegrationTest {
 				91.0,
 				-74.0060,
 				Instant.parse("2026-10-09T15:00:00Z"));
+
+		assertThrows(DataIntegrityViolationException.class, () -> processTelemetryEvent.execute(invalidEvent));
+		assertTrue(repository.findById(eventId).isEmpty());
+	}
+
+	@Test
+	void rejectsNonFinitePersistedSpeed() {
+		UUID eventId = UUID.randomUUID();
+		TelemetryEvent invalidEvent = new TelemetryEvent(
+				eventId,
+				"truck-17",
+				40.7128,
+				-74.0060,
+				Instant.parse("2026-10-09T15:00:00Z"),
+				Double.POSITIVE_INFINITY);
 
 		assertThrows(DataIntegrityViolationException.class, () -> processTelemetryEvent.execute(invalidEvent));
 		assertTrue(repository.findById(eventId).isEmpty());

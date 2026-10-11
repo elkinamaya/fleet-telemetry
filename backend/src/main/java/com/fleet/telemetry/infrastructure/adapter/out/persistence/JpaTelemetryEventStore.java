@@ -26,7 +26,8 @@ public class JpaTelemetryEventStore
 				event.vehicleId(),
 				event.latitude(),
 				event.longitude(),
-				event.timestamp()) == 1;
+				event.timestamp(),
+				event.speed()) == 1;
 	}
 
 	@Override
@@ -87,6 +88,7 @@ public class JpaTelemetryEventStore
 				entity.getVehicleId(),
 				entity.getLatitude(),
 				entity.getLongitude(),
-				entity.getEventTimestamp());
+				entity.getEventTimestamp(),
+				entity.getSpeed());
 	}
 }
