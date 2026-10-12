@@ -7,7 +7,11 @@ import com.fleet.telemetry.application.port.out.AiChatCompletionClient.Message;
 import com.fleet.telemetry.application.port.out.AiChatCompletionClient.ToolCall;
 import com.fleet.telemetry.application.port.out.AiChatCompletionClient.ToolDefinition;
 import com.fleet.telemetry.application.usecase.AiProviderUnavailableException;
+import com.fleet.telemetry.application.usecase.AiTelemetryQueryException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
@@ -18,6 +22,8 @@ import org.slf4j.MDC;
 
 import java.util.List;
 import java.util.Map;
+import java.time.Duration;
+import java.io.IOException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,6 +35,7 @@ import static org.springframework.test.web.client.match.MockRestRequestMatchers.
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withException;
 
 class OpenAiChatCompletionAdapterTest {
 
@@ -84,6 +91,187 @@ class OpenAiChatCompletionAdapterTest {
 
 		assertEquals("get_vehicle_current_state", result.toolCalls().getFirst().name());
 		assertEquals("{\"vehicleId\":\"truck-22\"}", result.toolCalls().getFirst().arguments());
+		server.verify();
+	}
+
+	@Test
+	void opensAfterFiveTransientFailuresAndClosesAfterTwoHalfOpenSuccesses() throws Exception {
+		RestClient.Builder builder = RestClient.builder();
+		builder.baseUrl("https://provider.example/v1");
+		MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+		CircuitBreaker circuitBreaker = testCircuitBreaker(Duration.ofMillis(25));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				builder.build(),
+				"test-model",
+				"fake-token",
+				circuitBreaker);
+		for (int i = 0; i < 5; i++) {
+			server.expect(requestTo("https://provider.example/v1/chat/completions"))
+					.andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+		}
+		server.expect(requestTo("https://provider.example/v1/chat/completions"))
+				.andRespond(withSuccess("""
+						{"choices":[{"message":{"content":"respuesta uno"}}]}
+						""", MediaType.APPLICATION_JSON));
+		server.expect(requestTo("https://provider.example/v1/chat/completions"))
+				.andRespond(withSuccess("""
+						{"choices":[{"message":{"content":"respuesta dos"}}]}
+						""", MediaType.APPLICATION_JSON));
+
+		for (int i = 0; i < 5; i++) {
+			assertThrows(
+					AiProviderUnavailableException.class,
+					() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+		}
+		assertEquals(CircuitBreaker.State.OPEN, circuitBreaker.getState());
+		assertEquals(5, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		assertThrows(
+				AiProviderUnavailableException.class,
+				() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+
+		Thread.sleep(50);
+
+		adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of());
+		assertEquals(CircuitBreaker.State.HALF_OPEN, circuitBreaker.getState());
+		adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of());
+		assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState());
+		server.verify();
+	}
+
+	@Test
+	void successfulProviderResponsesKeepCircuitClosed() {
+		RestClient.Builder builder = RestClient.builder();
+		builder.baseUrl("https://provider.example/v1");
+		MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+		CircuitBreaker circuitBreaker = testCircuitBreaker(Duration.ofSeconds(1));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				builder.build(),
+				"test-model",
+				"fake-token",
+				circuitBreaker);
+		for (int i = 0; i < 2; i++) {
+			server.expect(requestTo("https://provider.example/v1/chat/completions"))
+					.andRespond(withSuccess("""
+							{"choices":[{"message":{"content":"respuesta"}}]}
+							""", MediaType.APPLICATION_JSON));
+		}
+
+		adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of());
+		adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of());
+
+		assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState());
+		assertEquals(2, circuitBreaker.getMetrics().getNumberOfSuccessfulCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		server.verify();
+	}
+
+	@Test
+	void countsConnectionTimeoutAsTransientFailure() {
+		RestClient.Builder builder = RestClient.builder();
+		builder.baseUrl("https://provider.example/v1");
+		MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+		CircuitBreaker circuitBreaker = testCircuitBreaker(Duration.ofSeconds(1));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				builder.build(),
+				"test-model",
+				"fake-token",
+				circuitBreaker);
+		server.expect(requestTo("https://provider.example/v1/chat/completions"))
+				.andRespond(withException(new IOException("simulated timeout")));
+
+		assertThrows(
+				AiProviderUnavailableException.class,
+				() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+
+		assertEquals(1, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfSuccessfulCalls());
+		server.verify();
+	}
+
+	@Test
+	void ignoresProviderClientErrorsWithoutRecordingSuccessOrFailure() {
+		RestClient.Builder builder = RestClient.builder();
+		builder.baseUrl("https://provider.example/v1");
+		MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+		CircuitBreaker circuitBreaker = testCircuitBreaker(Duration.ofSeconds(1));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				builder.build(),
+				"test-model",
+				"fake-token",
+				circuitBreaker);
+		for (HttpStatus status : List.of(
+				HttpStatus.BAD_REQUEST,
+				HttpStatus.UNAUTHORIZED,
+				HttpStatus.FORBIDDEN,
+				HttpStatus.TOO_MANY_REQUESTS)) {
+			server.expect(requestTo("https://provider.example/v1/chat/completions"))
+					.andRespond(withStatus(status));
+		}
+
+		for (int i = 0; i < 4; i++) {
+			assertThrows(
+					AiProviderUnavailableException.class,
+					() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+		}
+
+		assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfSuccessfulCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfBufferedCalls());
+		server.verify();
+	}
+
+	@Test
+	void ignoresMissingKeyLocalValidationAndTelemetryQueryFailures() {
+		CircuitBreaker circuitBreaker = configuredCircuitBreaker(Duration.ofSeconds(1));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				RestClient.builder().baseUrl("https://provider.example/v1").build(),
+				"test-model",
+				"",
+				circuitBreaker);
+
+		assertThrows(
+				AiProviderUnavailableException.class,
+				() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+		assertThrows(
+				NullPointerException.class,
+				() -> new OpenAiChatCompletionAdapter(
+						RestClient.builder().build(),
+						"test-model",
+						"fake-token",
+						circuitBreaker).complete(null, List.of()));
+		assertThrows(
+				AiTelemetryQueryException.class,
+				() -> circuitBreaker.executeRunnable(() -> {
+					throw new AiTelemetryQueryException("consulta fallida", new IllegalStateException());
+				}));
+
+		assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfSuccessfulCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfBufferedCalls());
+	}
+
+	@Test
+	void countsMalformedProviderResponseAsTransientFailure() {
+		RestClient.Builder builder = RestClient.builder();
+		builder.baseUrl("https://provider.example/v1");
+		MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+		CircuitBreaker circuitBreaker = testCircuitBreaker(Duration.ofSeconds(1));
+		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
+				builder.build(),
+				"test-model",
+				"fake-token",
+				circuitBreaker);
+		server.expect(requestTo("https://provider.example/v1/chat/completions"))
+				.andRespond(withSuccess("{invalid json", MediaType.APPLICATION_JSON));
+
+		assertThrows(
+				AiProviderUnavailableException.class,
+				() -> adapter.complete(List.of(new Message("user", "consulta", null, null)), List.of()));
+
+		assertEquals(1, circuitBreaker.getMetrics().getNumberOfFailedCalls());
+		assertEquals(0, circuitBreaker.getMetrics().getNumberOfSuccessfulCalls());
 		server.verify();
 	}
 
@@ -226,7 +414,8 @@ class OpenAiChatCompletionAdapterTest {
 		OpenAiChatCompletionAdapter adapter = new OpenAiChatCompletionAdapter(
 				"https://provider.example/v1",
 				"test-model",
-				"");
+				"",
+				CircuitBreaker.ofDefaults("groq-test"));
 
 		AiProviderUnavailableException exception = assertThrows(
 				AiProviderUnavailableException.class,
@@ -237,5 +426,24 @@ class OpenAiChatCompletionAdapterTest {
 		assertEquals(
 				"La integración de IA no está configurada. Configure GROQ_API_KEY.",
 				exception.getMessage());
+	}
+
+	private CircuitBreaker testCircuitBreaker(Duration openWait) {
+		return configuredCircuitBreaker(openWait);
+	}
+
+	private CircuitBreaker configuredCircuitBreaker(Duration openWait) {
+		CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+				.slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+				.slidingWindowSize(10)
+				.minimumNumberOfCalls(5)
+				.failureRateThreshold(50)
+				.waitDurationInOpenState(openWait)
+				.permittedNumberOfCallsInHalfOpenState(2)
+				.automaticTransitionFromOpenToHalfOpenEnabled(false)
+				.recordException(exception -> exception instanceof GroqTransientFailureException)
+				.ignoreException(exception -> !(exception instanceof GroqTransientFailureException))
+				.build();
+		return CircuitBreaker.of("groq-test", config);
 	}
 }
