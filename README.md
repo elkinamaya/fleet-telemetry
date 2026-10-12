@@ -82,24 +82,36 @@ Ejemplo de solicitud:
 
 ### Prueba inicial de carga con k6
 
-El script `load/k6/telemetry.js` prueba únicamente `POST /api/telemetry`; no llama al proveedor de IA ni necesita claves externas. Requiere k6 instalado aparte (no es una dependencia Maven o npm), Kafka y PostgreSQL iniciados con Docker Compose y el backend ejecutándose en el host. Desde la raíz del repositorio, crea un `RUN_ID` nuevo para cada ejecución y ejecuta una prueba de humo de un usuario virtual:
+El script `load/k6/telemetry.js` prueba únicamente `POST /api/telemetry`; no llama al proveedor de IA ni necesita claves externas. Requiere k6 instalado aparte (no es una dependencia Maven o npm), Kafka y PostgreSQL iniciados con Docker Compose y el backend ejecutándose en el host. Desde la raíz del repositorio, crea un `RUN_ID` nuevo para cada ejecución. Para la primera prueba usa un VU y una duración suficiente para completar ciclos de proporciones:
 
 ```powershell
-$runId = [guid]::NewGuid().ToString("N")
-k6 run -e BASE_URL=http://localhost:8080 -e RUN_ID=$runId -e MAX_VUS=1 -e STAGE_SECONDS=10 -e THINK_TIME_SECONDS=1 -e P95_MAX_MS=1500 -e CHECK_FAILURE_RATE_MAX=0.01 load\k6\telemetry.js
+$env:BASE_URL = "http://localhost:8080"
+$env:RUN_ID = "smoke-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "1"
+$env:STAGE_SECONDS = "60"
+$env:THINK_TIME_SECONDS = "0.1"
+$env:DUPLICATE_PERCENT = "10"
+$env:INTENTIONAL_ERROR_PERCENT = "5"
+$env:TRAFFIC_RATE_TOLERANCE = "0.02"
+$env:P95_MAX_MS = "1500"
+$env:CHECK_FAILURE_RATE_MAX = "0"
+$env:UNEXPECTED_FAILURE_RATE_MAX = "0"
+
+k6 run .\load\k6\telemetry.js
 ```
 
-El escenario empieza con 1 usuario virtual, sube progresivamente por escalones de 5, 10, 20, 50, 100, 200, 500 y 1000 (omitiendo los que superen `MAX_VUS`) y mantiene el máximo configurado durante una etapa final. `STAGE_SECONDS` configura la duración de cada escalón y de esa etapa final; no representa una tasa de eventos por segundo. Cada VU envía una solicitud y espera `THINK_TIME_SECONDS` antes de la siguiente. Empieza con `MAX_VUS=1` y aumenta el máximo gradualmente, usando un `RUN_ID` nuevo por ejecución. El umbral exige al menos un POST aceptado para evitar que una ejecución sin iteraciones se considere válida.
+El escenario empieza con 1 usuario virtual, escala por niveles de 5, 10, 20, 50, 100, 200, 500 y 1000 (omitiendo los superiores a `MAX_VUS`) y mantiene el máximo configurado durante una etapa final. `STAGE_SECONDS` aplica a cada nivel y a la etapa final; no representa una tasa fija de eventos por segundo. Cada VU envía una solicitud y espera `THINK_TIME_SECONDS` antes de la siguiente. Con los valores predeterminados de caos, cada ciclo completo de 100 solicitudes por VU contiene 85 originales válidas, 10 duplicados exactos y 5 errores intencionales por latitud fuera de rango. Consulta [load/k6/README.md](./load/k6/README.md) para los comandos de escalado, métricas y verificación en PostgreSQL.
 
-`RUN_ID` es obligatorio y se incorpora al prefijo `vehicleId` (`k6-<RUN_ID>-<VU>`), de modo que cada ejecución tenga vehículos identificables y cada VU use un ID distinto. Cada solicitud genera un `eventId` UUID nuevo. Los parámetros admiten estos valores predeterminados: `BASE_URL=http://localhost:8080`, `MAX_VUS=1`, `STAGE_SECONDS=10`, `THINK_TIME_SECONDS=1`, `P95_MAX_MS=1500` y `CHECK_FAILURE_RATE_MAX=0.01`. k6 registra la duración HTTP (`http_req_duration`), la tasa de checks y los contadores `telemetry_posts_accepted` y `telemetry_http_errors`. La prueba falla si el p95 supera `P95_MAX_MS` o la tasa de checks fallidos supera `CHECK_FAILURE_RATE_MAX`; son umbrales iniciales configurables, no garantías de rendimiento.
+`RUN_ID` es obligatorio y se incorpora al prefijo `vehicleId` (`k6-<RUN_ID>-<VU>`), de modo que cada ejecución tenga vehículos identificables y cada VU use un ID distinto. Las solicitudes originales tienen UUID únicos; las duplicadas reutilizan exactamente el ID y payload de una original. Las inválidas usan `latitude: 91` y se esperan como `400 REQUEST_VALIDATION_FAILED`. El escenario separa resultados intencionales de fallos inesperados y verifica los porcentajes observados dentro de la tolerancia configurada. k6 registra latencia, checks, publicaciones aceptadas y contadores por tipo de solicitud. Los umbrales son criterios configurables de ensayo, no garantías de rendimiento.
 
-Un `202 Accepted` confirma que Kafka recibió la publicación, no que el consumidor ya haya persistido la fila en PostgreSQL. Tras permitir que el consumidor drene los eventos, contrasta `telemetry_posts_accepted` del resumen de k6 con las filas de esa ejecución (conserva `$runId` en la misma sesión PowerShell):
+Un `202 Accepted` confirma que Kafka recibió la publicación, no que el consumidor ya haya persistido la fila en PostgreSQL. Tras permitir que el consumidor drene los eventos, conserva el mismo `RUN_ID` en `$runId` y contrasta los originales aceptados de k6 con filas distintas persistidas:
 
 ```powershell
-docker compose exec db psql -U fleet -d fleet -c "SELECT count(*) AS persisted_events FROM telemetry_events WHERE vehicle_id LIKE 'k6-$runId-%';"
+$runId = $env:RUN_ID
+docker compose exec db psql -U fleet -d fleet -c "SELECT count(*) AS persisted_rows, count(DISTINCT event_id) AS distinct_event_ids, count(*) - count(DISTINCT event_id) AS duplicate_rows FROM telemetry_events WHERE left(vehicle_id, length('k6-$runId-')) = 'k6-$runId-';"
 ```
 
-La consulta no elimina ni modifica registros. Si los conteos difieren, revisa el tiempo de drenaje y los logs del consumidor; no interpretes el resultado HTTP por sí solo como confirmación de persistencia.
+La clave primaria `telemetry_events.event_id` y el `ON CONFLICT (event_id) DO NOTHING` del consumidor impiden filas repetidas para un ID, aunque una repetición pueda producir una segunda publicación en Kafka. En una corrida sin fallos inesperados, `persisted_rows` debe igualar `distinct_event_ids` y `telemetry_originals_accepted`; los duplicados no añaden filas. La consulta no elimina ni modifica registros. Si los conteos difieren, revisa el tiempo de drenaje, resultados ambiguos y logs del consumidor; no interpretes la respuesta HTTP por sí sola como confirmación de persistencia.
 
 ### Consultar el estado actual de un vehículo
 
