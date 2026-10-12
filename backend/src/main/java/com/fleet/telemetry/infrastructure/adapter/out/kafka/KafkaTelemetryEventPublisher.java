@@ -1,6 +1,7 @@
 package com.fleet.telemetry.infrastructure.adapter.out.kafka;
 
 import com.fleet.telemetry.application.port.out.TelemetryEventPublisher;
+import com.fleet.telemetry.application.port.out.TelemetryPublicationException;
 import com.fleet.telemetry.domain.model.TelemetryEvent;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.KafkaException;

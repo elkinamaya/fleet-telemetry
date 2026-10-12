@@ -8,6 +8,43 @@ El publicador espera el acuse del broker antes de responder `202 Accepted`. Si K
 
 El adaptador web no depende de Kafka directamente: el caso de uso depende del puerto de publicación y el adaptador Kafka implementa ese puerto. Kafka recibe un listener interno (`kafka:9092`) y uno externo (`localhost:29092`) para permitir tanto la comunicación de Compose como la ejecución local de Spring Boot.
 
+`POST /api/telemetry/batch` permite enviar hasta 100 eventos en una sola solicitud para clientes que sincronizan una cola offline. El cuerpo contiene `events`, una lista de los mismos objetos aceptados por `POST /api/telemetry`; cada evento conserva su `eventId` original. Todos los elementos se validan antes de publicar: un lote vacío, mayor de 100, con un elemento inválido o con `eventId` repetido se rechaza con `400 REQUEST_VALIDATION_FAILED` y no publica ningún elemento. Los IDs únicos dentro del lote permiten correlacionar sin ambigüedad la respuesta con cada evento.
+
+Después de superar la validación, la aplicación publica cada evento individualmente mediante el mismo caso de uso y puerto Kafka que usa el endpoint individual. No hay transacción ni atomicidad entre publicaciones: si Kafka no confirma un evento, se informa como `PUBLICATION_UNCONFIRMED` y se continúa con los siguientes. La respuesta devuelve `results`, con `eventId`, `status` (`PUBLISHED` o `PUBLICATION_UNCONFIRMED`) y `errorCode` cuando la publicación no fue confirmada. Se devuelve `202 Accepted` si Kafka confirmó todos los eventos y `207 Multi-Status` si uno o más quedaron sin confirmar.
+
+Ejemplo de lote válido:
+
+```json
+{
+  "events": [
+    {
+      "eventId": "a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50",
+      "vehicleId": "truck-17",
+      "latitude": 40.7128,
+      "longitude": -74.006,
+      "timestamp": "2026-10-09T15:00:00Z",
+      "speed": 54.5
+    }
+  ]
+}
+```
+
+Ejemplo del resultado cuando una publicación no se pudo confirmar:
+
+```json
+{
+  "results": [
+    {
+      "eventId": "a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50",
+      "status": "PUBLICATION_UNCONFIRMED",
+      "errorCode": "TELEMETRY_PUBLICATION_UNAVAILABLE"
+    }
+  ]
+}
+```
+
+`PUBLICATION_UNCONFIRMED` no permite inferir que Kafka definitivamente no recibió el evento: ante una interrupción o un timeout el resultado puede ser ambiguo. El cliente debe conservar y reintentar el mismo payload y `eventId`, sin generar un ID sustituto. La persistencia deduplica por `eventId`, pero una respuesta `202` o un resultado `PUBLISHED` solo indica que Kafka confirmó la publicación; no que PostgreSQL ya haya persistido la telemetría.
+
 Los eventos recibidos por el consumidor Kafka se guardan en `telemetry_events` en PostgreSQL/TimescaleDB. `event_id` es clave primaria y la inserción usa `ON CONFLICT DO NOTHING`; una entrega repetida no duplica el evento, pero fallos reales de base de datos se propagan al contenedor Kafka. Si un productor reutiliza un `eventId` con contenido distinto, hoy también se ignora silenciosamente el segundo contenido y prevalece el primer registro. Como mejora pendiente, el adaptador de persistencia debería distinguir duplicados idénticos de colisiones de ID comparando el contenido existente; una colisión debería registrarse y tratarse como error no reintentable o enviarse a una dead-letter topic, sin sobrescribir la telemetría original. La tabla usa `TIMESTAMPTZ` para conservar el instante UTC. Es una tabla PostgreSQL normal (no hypertable), porque la restricción global por `event_id` no sería válida en una hypertable particionada por tiempo.
 
 La columna `speed` es nullable para conservar registros históricos. `schema.sql` agrega la columna con `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, por lo que una base existente se actualiza sin recrear la tabla ni perder eventos. La base también rechaza velocidades negativas o no finitas.
@@ -39,7 +76,7 @@ Ejemplo de solicitud:
 
 ### Fallos conocidos y alcance pendiente
 
-- Un error de publicación devuelve `503`; no hay almacenamiento local de respaldo. El cliente decide cuándo reintentar y debe reutilizar el mismo `eventId`.
+- En `POST /api/telemetry`, un error de publicación devuelve `503`; en el endpoint batch, los resultados de publicación no confirmada se indican por evento con `207`. No hay almacenamiento local de respaldo en el backend. El cliente decide cuándo reintentar y debe reutilizar el mismo `eventId`.
 - El consumidor reintenta con espera de un segundo dos veces. Si persiste el fallo, el registro no se recupera como exitoso y Kafka lo vuelve a entregar; el registro fallido puede detener el avance de su partición hasta que se resuelva la causa.
 - La respuesta HTTP `202` confirma la publicación en Kafka, no que el consumidor ya haya persistido el evento.
 

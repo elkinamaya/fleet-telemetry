@@ -1,8 +1,9 @@
 package com.fleet.telemetry.infrastructure.adapter.in.web;
 
 import com.fleet.telemetry.application.usecase.SubmitTelemetryEvent;
+import com.fleet.telemetry.application.usecase.SubmitTelemetryBatch;
+import com.fleet.telemetry.application.port.out.TelemetryPublicationException;
 import com.fleet.telemetry.domain.model.TelemetryEvent;
-import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryPublicationException;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
@@ -10,13 +11,18 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
+import java.util.UUID;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentCaptor.forClass;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -32,6 +38,9 @@ class TelemetryControllerTest {
 
 	@MockitoBean
 	private SubmitTelemetryEvent submitTelemetryEvent;
+
+	@MockitoBean
+	private SubmitTelemetryBatch submitTelemetryBatch;
 
 	@Test
 	void acceptsAndSubmitsValidTelemetry() throws Exception {
@@ -53,6 +62,136 @@ class TelemetryControllerTest {
 		var event = forClass(TelemetryEvent.class);
 		verify(submitTelemetryEvent).execute(event.capture());
 		assertEquals(54.5, event.getValue().speed());
+	}
+
+	@Test
+	void acceptsBatchAndReturnsPublicationResultForEachOriginalEventId() throws Exception {
+		UUID firstId = UUID.fromString("a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50");
+		UUID secondId = UUID.fromString("b3ac3a4a-c992-4d8e-9987-0a2f43d7ad51");
+		when(submitTelemetryBatch.execute(anyList())).thenAnswer(invocation -> {
+			List<TelemetryEvent> events = invocation.getArgument(0);
+			assertEquals(List.of(firstId, secondId), events.stream().map(TelemetryEvent::eventId).toList());
+			assertEquals(40.7128, events.getFirst().latitude());
+			return events.stream()
+					.map(event -> new SubmitTelemetryBatch.Result(
+							event.eventId(),
+							SubmitTelemetryBatch.Status.PUBLISHED))
+					.toList();
+		});
+
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{"events":[
+								  {"eventId":"a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50","vehicleId":"truck-17","latitude":40.7128,"longitude":-74.006,"timestamp":"2026-10-09T15:00:00Z","speed":54.5},
+								  {"eventId":"b3ac3a4a-c992-4d8e-9987-0a2f43d7ad51","vehicleId":"truck-18","latitude":41.0,"longitude":-75.0,"timestamp":"2026-10-09T15:01:00Z"}
+								]}
+								"""))
+				.andExpect(status().isAccepted())
+				.andExpect(jsonPath("$.results.length()").value(2))
+				.andExpect(jsonPath("$.results[0].eventId").value(firstId.toString()))
+				.andExpect(jsonPath("$.results[0].status").value("PUBLISHED"))
+				.andExpect(jsonPath("$.results[0].errorCode").doesNotExist())
+				.andExpect(jsonPath("$.results[1].eventId").value(secondId.toString()))
+				.andExpect(jsonPath("$.results[1].status").value("PUBLISHED"));
+	}
+
+	@Test
+	void returnsMultiStatusWithPerEventPublicationFailure() throws Exception {
+		UUID publishedId = UUID.fromString("a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50");
+		UUID failedId = UUID.fromString("b3ac3a4a-c992-4d8e-9987-0a2f43d7ad51");
+		when(submitTelemetryBatch.execute(anyList())).thenReturn(List.of(
+				new SubmitTelemetryBatch.Result(publishedId, SubmitTelemetryBatch.Status.PUBLISHED),
+				new SubmitTelemetryBatch.Result(failedId, SubmitTelemetryBatch.Status.PUBLICATION_UNCONFIRMED)));
+
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{"events":[
+								  {"eventId":"a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50","vehicleId":"truck-17","latitude":40.7128,"longitude":-74.006,"timestamp":"2026-10-09T15:00:00Z"},
+								  {"eventId":"b3ac3a4a-c992-4d8e-9987-0a2f43d7ad51","vehicleId":"truck-18","latitude":41.0,"longitude":-75.0,"timestamp":"2026-10-09T15:01:00Z"}
+								]}
+								"""))
+				.andExpect(status().isMultiStatus())
+				.andExpect(jsonPath("$.results[0].eventId").value(publishedId.toString()))
+				.andExpect(jsonPath("$.results[0].status").value("PUBLISHED"))
+				.andExpect(jsonPath("$.results[1].eventId").value(failedId.toString()))
+				.andExpect(jsonPath("$.results[1].status").value("PUBLICATION_UNCONFIRMED"))
+				.andExpect(jsonPath("$.results[1].errorCode").value("TELEMETRY_PUBLICATION_UNAVAILABLE"))
+				.andExpect(content().string(org.hamcrest.Matchers.not(
+						org.hamcrest.Matchers.containsString("Kafka unavailable"))));
+	}
+
+	@Test
+	void acceptsBatchAtMaximumSize() throws Exception {
+		List<String> eventIds = java.util.stream.IntStream.range(0, TelemetryBatchRequest.MAX_EVENTS)
+				.mapToObj(index -> UUID.nameUUIDFromBytes(
+						("batch-event-" + index).getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+				.map(UUID::toString)
+				.toList();
+		when(submitTelemetryBatch.execute(anyList())).thenAnswer(invocation -> {
+			List<TelemetryEvent> events = invocation.getArgument(0);
+			assertEquals(eventIds, events.stream().map(event -> event.eventId().toString()).toList());
+			return events.stream()
+					.map(event -> new SubmitTelemetryBatch.Result(
+							event.eventId(),
+							SubmitTelemetryBatch.Status.PUBLISHED))
+					.toList();
+		});
+		String requestBody = "{\"events\":[" + String.join(",", eventIds.stream()
+				.map(eventId -> """
+						{"eventId":"%s","vehicleId":"truck-boundary","latitude":40,"longitude":-74,"timestamp":"2026-10-09T15:00:00Z"}
+						""".formatted(eventId).trim())
+				.toList()) + "]}";
+
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content(requestBody))
+				.andExpect(status().isAccepted())
+				.andExpect(jsonPath("$.results.length()").value(TelemetryBatchRequest.MAX_EVENTS));
+	}
+
+	@Test
+	void rejectsEmptyOversizedInvalidAndDuplicateIdBatchesBeforePublishing() throws Exception {
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("{\"events\":[]}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+
+		List<String> oversizedEvents = java.util.stream.IntStream.rangeClosed(1, 101)
+				.mapToObj(index -> """
+						{"eventId":"%08d-0000-0000-0000-000000000000","vehicleId":"truck-%s","latitude":40,"longitude":-74,"timestamp":"2026-10-09T15:00:00Z"}
+						""".formatted(index, index).trim())
+				.toList();
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("{\"events\":[" + String.join(",", oversizedEvents) + "]}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{"events":[
+								  {"eventId":"a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50","vehicleId":"truck-17","latitude":91,"longitude":-74,"timestamp":"2026-10-09T15:00:00Z"}
+								]}
+								"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+
+		mockMvc.perform(post("/api/telemetry/batch")
+						.contentType(APPLICATION_JSON)
+						.content("""
+								{"events":[
+								  {"eventId":"a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50","vehicleId":"truck-17","latitude":40,"longitude":-74,"timestamp":"2026-10-09T15:00:00Z"},
+								  {"eventId":"a3ac3a4a-c992-4d8e-9987-0a2f43d7ad50","vehicleId":"truck-18","latitude":41,"longitude":-75,"timestamp":"2026-10-09T15:01:00Z"}
+								]}
+								"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+
+		verifyNoInteractions(submitTelemetryBatch);
 	}
 
 	@Test

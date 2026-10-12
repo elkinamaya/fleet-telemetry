@@ -3,7 +3,7 @@ package com.fleet.telemetry.infrastructure.adapter.in.web;
 import com.fleet.telemetry.application.usecase.AiProviderUnavailableException;
 import com.fleet.telemetry.application.usecase.AiTelemetryQueryException;
 import com.fleet.telemetry.application.usecase.VehicleTelemetryNotFoundException;
-import com.fleet.telemetry.infrastructure.adapter.out.kafka.TelemetryPublicationException;
+import com.fleet.telemetry.application.port.out.TelemetryPublicationException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.ConstraintViolationException;
