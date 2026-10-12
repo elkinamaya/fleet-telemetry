@@ -43,6 +43,27 @@ Ejemplo de solicitud:
 - El consumidor reintenta con espera de un segundo dos veces. Si persiste el fallo, el registro no se recupera como exitoso y Kafka lo vuelve a entregar; el registro fallido puede detener el avance de su partición hasta que se resuelva la causa.
 - La respuesta HTTP `202` confirma la publicación en Kafka, no que el consumidor ya haya persistido el evento.
 
+### Prueba inicial de carga con k6
+
+El script `load/k6/telemetry.js` prueba únicamente `POST /api/telemetry`; no llama al proveedor de IA ni necesita claves externas. Requiere k6 instalado aparte (no es una dependencia Maven o npm), Kafka y PostgreSQL iniciados con Docker Compose y el backend ejecutándose en el host. Desde la raíz del repositorio, crea un `RUN_ID` nuevo para cada ejecución y ejecuta una prueba de humo de un usuario virtual:
+
+```powershell
+$runId = [guid]::NewGuid().ToString("N")
+k6 run -e BASE_URL=http://localhost:8080 -e RUN_ID=$runId -e MAX_VUS=1 -e STAGE_SECONDS=10 -e THINK_TIME_SECONDS=1 -e P95_MAX_MS=1500 -e CHECK_FAILURE_RATE_MAX=0.01 load\k6\telemetry.js
+```
+
+El escenario empieza con 1 usuario virtual, sube progresivamente por escalones de 5, 10, 20, 50, 100, 200, 500 y 1000 (omitiendo los que superen `MAX_VUS`) y mantiene el máximo configurado durante una etapa final. `STAGE_SECONDS` configura la duración de cada escalón y de esa etapa final; no representa una tasa de eventos por segundo. Cada VU envía una solicitud y espera `THINK_TIME_SECONDS` antes de la siguiente. Empieza con `MAX_VUS=1` y aumenta el máximo gradualmente, usando un `RUN_ID` nuevo por ejecución. El umbral exige al menos un POST aceptado para evitar que una ejecución sin iteraciones se considere válida.
+
+`RUN_ID` es obligatorio y se incorpora al prefijo `vehicleId` (`k6-<RUN_ID>-<VU>`), de modo que cada ejecución tenga vehículos identificables y cada VU use un ID distinto. Cada solicitud genera un `eventId` UUID nuevo. Los parámetros admiten estos valores predeterminados: `BASE_URL=http://localhost:8080`, `MAX_VUS=1`, `STAGE_SECONDS=10`, `THINK_TIME_SECONDS=1`, `P95_MAX_MS=1500` y `CHECK_FAILURE_RATE_MAX=0.01`. k6 registra la duración HTTP (`http_req_duration`), la tasa de checks y los contadores `telemetry_posts_accepted` y `telemetry_http_errors`. La prueba falla si el p95 supera `P95_MAX_MS` o la tasa de checks fallidos supera `CHECK_FAILURE_RATE_MAX`; son umbrales iniciales configurables, no garantías de rendimiento.
+
+Un `202 Accepted` confirma que Kafka recibió la publicación, no que el consumidor ya haya persistido la fila en PostgreSQL. Tras permitir que el consumidor drene los eventos, contrasta `telemetry_posts_accepted` del resumen de k6 con las filas de esa ejecución (conserva `$runId` en la misma sesión PowerShell):
+
+```powershell
+docker compose exec db psql -U fleet -d fleet -c "SELECT count(*) AS persisted_events FROM telemetry_events WHERE vehicle_id LIKE 'k6-$runId-%';"
+```
+
+La consulta no elimina ni modifica registros. Si los conteos difieren, revisa el tiempo de drenaje y los logs del consumidor; no interpretes el resultado HTTP por sí solo como confirmación de persistencia.
+
 ### Consultar el estado actual de un vehículo
 
 `GET /api/vehicles/{vehicleId}/state` devuelve `200 OK` con el ID del evento, vehículo, latitud, longitud, velocidad en km/h (o `null` si no estaba disponible) y timestamp del evento de telemetría más reciente según `event_timestamp` (no el orden de inserción). Los resultados del historial que usa el agente de IA incluyen también `speed`. Si no hay eventos para el vehículo, devuelve `404 Not Found`.
