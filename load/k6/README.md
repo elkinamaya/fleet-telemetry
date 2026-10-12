@@ -1,66 +1,145 @@
 # Pruebas de carga con k6
 
-## Propósito
+## Propósito y alcance
 
-k6 permite medir el comportamiento HTTP de la API bajo una carga controlada. Este escenario mide la publicación de eventos de telemetría; no es por sí mismo una prueba de estrés, resistencia, saturación o recuperación.
+k6 mide el comportamiento HTTP de publicación de telemetría con carga controlada. El escenario mezcla solicitudes originales válidas, reenvíos duplicados y solicitudes inválidas intencionales. No es por sí solo una prueba de estrés, resistencia, recuperación ni disponibilidad productiva.
 
 ## Prerrequisitos
 
-- k6 instalado en la máquina que ejecuta la prueba. k6 es una herramienta externa; no es una dependencia Maven del backend.
-- El backend disponible en la URL configurada.
-- Kafka y PostgreSQL en ejecución, ya que el endpoint publica en Kafka y el consumidor persiste los eventos en PostgreSQL.
+- k6 instalado en la máquina que ejecuta la prueba; es una herramienta externa, no una dependencia Maven del backend.
+- Backend disponible en la URL configurada.
+- Kafka y PostgreSQL en ejecución; el endpoint publica en Kafka y el consumidor persiste en PostgreSQL.
 
-Para el entorno local documentado en el README principal, Kafka y PostgreSQL se inician con Docker Compose y el backend se ejecuta en el host.
+En el entorno local documentado por el README principal, Kafka y PostgreSQL se inician con Docker Compose y Spring Boot se ejecuta en el host.
 
-## Ubicación del script
+## Escenario y contrato
 
-El escenario se encuentra en [`telemetry.js`](./telemetry.js). Envía solicitudes al endpoint `POST /api/telemetry`, usando el contrato real de la API.
+[`telemetry.js`](./telemetry.js) envía solicitudes a `POST /api/telemetry`.
+
+- Solicitud original válida: `eventId` UUID nuevo, `vehicleId` `k6-<RUN_ID>-<VU>`, coordenadas y timestamp ISO-8601 actuales, `speed: 45` km/h. Se espera `202`.
+- Duplicado: reutiliza exactamente el mismo objeto JSON (incluidos `eventId`, timestamp y payload) de una solicitud original válida de ese mismo VU/ciclo. Se espera `202`; el endpoint vuelve a publicar, y PostgreSQL debe conservar una sola fila por `eventId`.
+- Error intencional: cambia `latitude` a `91`, fuera del rango real de `TelemetryRequest` (`-90` a `90`). El backend responde `400` con código Problem Details `REQUEST_VALIDATION_FAILED`; esa respuesta se registra como el resultado esperado, no como un fallo del servicio.
+
+El script clasifica como inesperado cualquier status diferente del contrato correspondiente, un error de transporte/status `0`, una solicitud inválida aceptada (`202`) o una respuesta `400` que no contenga el código de validación esperado. Un error inesperado de una solicitud inválida cuenta como fallo del sistema, igual que el de una solicitud original o duplicada. El endpoint y su contrato de producción no se modifican.
+
+## Porcentajes y reproducibilidad
+
+`DUPLICATE_PERCENT` (predeterminado `10`) e `INTENTIONAL_ERROR_PERCENT` (predeterminado `5`) son porcentajes enteros del total de solicitudes HTTP. Cada VU asigna sus iteraciones a ciclos locales deterministas de 100 solicitudes: primero originales válidas, luego el porcentaje duplicado y, al final, el porcentaje inválido. Con los valores predeterminados, cada ciclo completo contiene 85 originales únicas, 10 reenvíos del mismo payload original del ciclo y 5 solicitudes inválidas.
+
+La secuencia es local a cada VU, por lo que no depende de memoria compartida ni de la carrera entre VUs. Los porcentajes son exactos para ciclos completos de cada VU; el ramping puede terminar VUs en ciclos parciales y producir una desviación agregada pequeña o importante en ejecuciones cortas. Las métricas de tasas informan la proporción realmente observada y sus thresholds la comparan con los objetivos dentro de `TRAFFIC_RATE_TOLERANCE` (predeterminado 0.02, es decir, ±2 puntos porcentuales). Si la ejecución no completa suficientes ciclos, los thresholds fallan en vez de declarar cumplido el porcentaje. Usa la salida de k6 para registrar los conteos y tasas efectivos, no solo la configuración.
+
+Cada VU representa un vehículo identificable durante una ejecución; cientos de VUs no equivalen a una tasa fija de solicitudes por segundo. La tasa real depende de latencia, pausa por iteración, CPU y capacidad del entorno.
 
 ## Configuración
 
-Los valores corresponden a los valores predeterminados de `telemetry.js`, excepto `RUN_ID`, que es obligatorio:
-
-| Variable | Valor por defecto | Uso |
+| Variable | Valor predeterminado | Uso |
 |---|---:|---|
 | `BASE_URL` | `http://localhost:8080` | URL base del backend. |
-| `RUN_ID` | Sin valor; obligatorio | Identificador de la ejecución, incorporado al prefijo de `vehicleId` como `k6-<RUN_ID>-<VU>`. Admite de 1 a 50 letras, números, guiones y guiones bajos. |
-| `MAX_VUS` | `1` | Máximo de usuarios virtuales. Debe ser un entero positivo. |
-| `STAGE_SECONDS` | `10` | Duración de cada etapa de rampa y de la etapa final al máximo. Debe ser positivo. |
-| `THINK_TIME_SECONDS` | `1` | Pausa entre solicitudes de cada VU. Debe ser cero o positiva. |
-| `P95_MAX_MS` | `1500` | Umbral máximo exclusivo para el percentil 95 de `http_req_duration`, en milisegundos. |
-| `CHECK_FAILURE_RATE_MAX` | `0` | Tasa máxima admitida de checks fallidos, como proporción entre `0` y `1`. Con `0`, todos los POST deben responder `202`. |
+| `RUN_ID` | Obligatorio | Prefijo aislado `k6-<RUN_ID>-<VU>`; de 1 a 50 letras, números, guiones o guiones bajos. Usa un valor nuevo por ejecución. |
+| `MAX_VUS` | `1` | Máximo de usuarios/vehículos virtuales; entero positivo. |
+| `STAGE_SECONDS` | `10` | Duración de cada etapa de rampa y de la meseta final. |
+| `THINK_TIME_SECONDS` | `1` | Pausa entre solicitudes de cada VU; puede ser cero. |
+| `DUPLICATE_PERCENT` | `10` | Porcentaje entero de solicitudes que reenvía el payload original. |
+| `INTENTIONAL_ERROR_PERCENT` | `5` | Porcentaje entero de solicitudes con latitud inválida. Debe sumar menos de 100 junto con el porcentaje de duplicados. |
+| `TRAFFIC_RATE_TOLERANCE` | `0.02` | Tolerancia absoluta entre la tasa observada y cada porcentaje objetivo, entre 0 y 1. |
+| `P95_MAX_MS` | `1500` | Umbral superior exclusivo de p95 para `http_req_duration`, en milisegundos. |
+| `CHECK_FAILURE_RATE_MAX` | `0` | Tasa máxima de checks fallidos, como proporción entre 0 y 1. Un check pasa si se observó el status/código esperado, incluidos los `400` intencionales correctos. |
+| `UNEXPECTED_FAILURE_RATE_MAX` | `0` | Tasa máxima admitida de fallos inesperados; predeterminado estricto, sin tolerancia. |
 
-El escenario empieza con 1 VU y usa etapas progresivas hasta `MAX_VUS`, con escalones intermedios de 5, 10, 20, 50, 100, 200, 500 y 1000 cuando no superan el máximo configurado. La etapa final mantiene el máximo configurado durante `STAGE_SECONDS`. El número de VUs no representa una tasa fija de solicitudes por segundo: la tasa observada también depende de la latencia HTTP y de la pausa entre iteraciones.
+El escenario inicia con 1 VU y escala hasta `MAX_VUS` por los niveles 5, 10, 20, 50, 100, 200, 500 y 1000 que no superen el máximo; termina con una etapa de meseta al máximo. `STAGE_SECONDS` aplica a cada nivel. Los thresholds de p95 y fiabilidad son parámetros de ensayo, no garantías de rendimiento.
 
-Cada POST recibe un UUID nuevo como `eventId`; cada VU usa un `vehicleId` derivado del `RUN_ID`. El cuerpo también incluye latitud, longitud, timestamp ISO-8601 actual y `speed: 45` km/h. Esta velocidad reduce la posibilidad de activar la regla de vehículo detenido; no sustituye una prueba funcional independiente de alertas.
+## Métricas y umbrales
 
-## Ejecución en PowerShell
+- `telemetry_original_requests` y `telemetry_originals_accepted`: originales válidas intentadas y aceptadas con `202`.
+- `telemetry_duplicate_requests` y `telemetry_duplicates_accepted`: reenvíos intentados y confirmados con `202`.
+- `telemetry_intentional_invalid_requests` y `telemetry_expected_validation_errors`: inválidas intencionales y respuestas `400 REQUEST_VALIDATION_FAILED` esperadas.
+- `telemetry_validation_scenario_failures`: solicitud inválida aceptada (`202`) o rechazada con `400` sin el código esperado.
+- `telemetry_unexpected_failures` y `telemetry_unexpected_failure_rate`: fallos de contrato/servidor/transportes inesperados, también cuando afectan una solicitud inválida.
+- `telemetry_duplicate_request_rate` y `telemetry_intentional_error_rate`: proporciones reales de cada tipo sobre las solicitudes ejecutadas.
+- `telemetry_posts_accepted` y `telemetry_http_errors`: respectivamente total de respuestas `202` y total de respuestas no `202`; este último incluye los `400` intencionales esperados.
+- `http_req_duration`, `http_req_failed` y `checks`: métricas k6 estándar. `http_req_failed` considera los `400` como fallos HTTP aunque sean las respuestas esperadas para el escenario inválido; para separar fallos del sistema, usa `telemetry_unexpected_failures`, su tasa y los checks del contrato esperado.
 
-Con las dependencias disponibles y el backend iniciado, desde la raíz del repositorio:
+Los thresholds de checks, tasa de fallos inesperados, porcentajes, p95 y al menos una solicitud aceptada deben cumplirse. No eleves tolerancias ni tasas de fallo para ocultar problemas; si la variación viene de ciclos incompletos, extiende la duración de la etapa.
+
+## Prueba pequeña inicial en PowerShell
+
+Con la infraestructura local iniciada y el backend accesible, ejecuta desde la raíz. Una nueva ejecución necesita un `RUN_ID` único:
 
 ```powershell
 $env:BASE_URL = "http://localhost:8080"
-$env:RUN_ID = "loadtest-$(Get-Date -Format yyyyMMdd-HHmmss)"
-$env:MAX_VUS = "10"
-$env:STAGE_SECONDS = "10"
-$env:THINK_TIME_SECONDS = "1"
+$env:RUN_ID = "smoke-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "1"
+$env:STAGE_SECONDS = "60"
+$env:THINK_TIME_SECONDS = "0.1"
+$env:DUPLICATE_PERCENT = "10"
+$env:INTENTIONAL_ERROR_PERCENT = "5"
+$env:TRAFFIC_RATE_TOLERANCE = "0.02"
 $env:P95_MAX_MS = "1500"
 $env:CHECK_FAILURE_RATE_MAX = "0"
+$env:UNEXPECTED_FAILURE_RATE_MAX = "0"
 
 k6 run .\load\k6\telemetry.js
 ```
 
-Para cada ejecución, asigna un `RUN_ID` nuevo de modo que sus vehículos puedan distinguirse de otras ejecuciones. Mantén `CHECK_FAILURE_RATE_MAX=0` para exigir que todos los checks de status `202` tengan éxito; aumentarlo permite checks fallidos y relaja ese criterio. Los thresholds son criterios de ensayo configurables, no garantías de rendimiento.
+Revisa que haya originales aceptadas, duplicados aceptados, errores intencionales coincidentes con respuestas esperadas, cero fallos inesperados y tasas dentro de tolerancia. Si los contadores de duplicados o errores esperados son cero o los thresholds de tasa fallan, la muestra fue demasiado corta; aumenta `STAGE_SECONDS` con un `RUN_ID` nuevo y repite. No uses una tasa de solicitudes por segundo inferida del número de VUs.
 
-## Qué mide la prueba
+## Escalado progresivo
 
-- `http_req_duration`: duración observada de las solicitudes HTTP, incluida la espera que hace el endpoint al publicar en Kafka.
-- Check `POST /api/telemetry returns 202`: comprueba el status HTTP de cada respuesta.
-- `http_req_failed`: métrica incorporada de solicitudes HTTP fallidas que k6 muestra en sus resultados.
-- `telemetry_posts_accepted`: contador del script incrementado por cada respuesta `202`.
-- `telemetry_http_errors`: contador del script incrementado cuando la respuesta no es `202`.
+Solo aumenta la carga si el nivel anterior cumple los thresholds y el entorno está estable. Ejecuta cada bloque de forma independiente y usa un `RUN_ID` nuevo en cada corrida:
 
-El script define tres thresholds: p95 de `http_req_duration`, tasa de éxito de checks y al menos un POST aceptado. Con `CHECK_FAILURE_RATE_MAX=0`, el threshold de checks requiere una tasa de éxito del 100 %: cualquier respuesta distinta de `202` incumple ese criterio y hace fallar la ejecución. El threshold de al menos un POST evita aprobar una ejecución sin muestras aceptadas. Los checks fallidos y `http_req_failed` no son la misma medición: el check evalúa el contrato exacto `202`, mientras que `http_req_failed` es la métrica HTTP incorporada de k6. Los contadores `telemetry_posts_accepted` y `telemetry_http_errors` permiten ver respectivamente las respuestas aceptadas y las no aceptadas en los resultados.
+```powershell
+$env:RUN_ID = "load50-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "50"
+$env:STAGE_SECONDS = "15"
+k6 run .\load\k6\telemetry.js
+```
+
+Después de revisar la salida y la persistencia, escala gradualmente:
+
+```powershell
+$env:RUN_ID = "load100-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "100"
+k6 run .\load\k6\telemetry.js
+```
+
+```powershell
+$env:RUN_ID = "load200-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "200"
+k6 run .\load\k6\telemetry.js
+```
+
+```powershell
+$env:RUN_ID = "load500-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$env:MAX_VUS = "500"
+k6 run .\load\k6\telemetry.js
+```
+
+No avances al siguiente nivel si hay fallos inesperados, thresholds incumplidos, retraso acumulado del consumidor o recursos saturados. Ajusta la duración explícitamente y conserva la configuración y salida de cada ejecución.
+
+## Comprobar persistencia e idempotencia en PostgreSQL
+
+El esquema real define `telemetry_events.event_id` como clave primaria y el repositorio inserta con `ON CONFLICT (event_id) DO NOTHING`. Los reenvíos duplicados pueden producir más de una publicación Kafka, pero la clave primaria evita más de una fila por ID. `202 Accepted` confirma la publicación en Kafka, no la persistencia.
+
+Tras terminar k6, espera a que el consumidor procese los mensajes pendientes. Desde PowerShell, conserva exactamente el `RUN_ID` utilizado:
+
+```powershell
+$runId = $env:RUN_ID
+docker compose exec db psql -U fleet -d fleet -c "SELECT count(*) AS persisted_rows, count(DISTINCT event_id) AS distinct_event_ids, count(*) - count(DISTINCT event_id) AS duplicate_rows FROM telemetry_events WHERE left(vehicle_id, length('k6-$runId-')) = 'k6-$runId-';"
+```
+
+En una ejecución sin fallos inesperados, `persisted_rows` debe igualar `distinct_event_ids`, `duplicate_rows` debe ser 0 y el total debe coincidir con `telemetry_originals_accepted` de k6. Las 10 % solicitudes duplicadas no deberían añadir filas. Las solicitudes inválidas no se publican ni persisten. Si hubo errores de publicación o respuesta ambigua, el número persistido puede diferir de los originales aceptados; investiga en vez de atribuir automáticamente la diferencia a duplicados.
+
+La siguiente consulta debe devolver cero filas; permite detectar visualmente cualquier duplicidad por ID dentro del prefijo de la ejecución:
+
+```powershell
+docker compose exec db psql -U fleet -d fleet -c "SELECT event_id, count(*) AS rows_per_event FROM telemetry_events WHERE left(vehicle_id, length('k6-$runId-')) = 'k6-$runId-' GROUP BY event_id HAVING count(*) > 1;"
+```
+
+La columna `event_id` es una clave primaria, por lo que filas duplicadas con ese ID están además impedidas por el esquema. Esta verificación posterior en PostgreSQL es independiente de las métricas HTTP de k6 y solo es válida después de permitir que Kafka sea consumido.
+
+## Resultados históricos
+
+Las ejecuciones que se presentan a continuación corresponden a versiones anteriores del escenario, sin inyección configurable de duplicados ni solicitudes inválidas. Se conservan como evidencia histórica y no como resultados de la nueva prueba. La modificación del script no ejecuta carga ni actualiza resultados.
 
 ## Primera prueba baseline
 
