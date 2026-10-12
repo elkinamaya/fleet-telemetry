@@ -43,6 +43,27 @@ Ejemplo de solicitud:
 - El consumidor reintenta con espera de un segundo dos veces. Si persiste el fallo, el registro no se recupera como exitoso y Kafka lo vuelve a entregar; el registro fallido puede detener el avance de su partición hasta que se resuelva la causa.
 - La respuesta HTTP `202` confirma la publicación en Kafka, no que el consumidor ya haya persistido el evento.
 
+### Prueba inicial de carga con k6
+
+El script `load/k6/telemetry.js` prueba únicamente `POST /api/telemetry`; no llama al proveedor de IA ni necesita claves externas. Requiere k6 instalado aparte (no es una dependencia Maven o npm), Kafka y PostgreSQL iniciados con Docker Compose y el backend ejecutándose en el host. Desde la raíz del repositorio, crea un `RUN_ID` nuevo para cada ejecución y ejecuta una prueba de humo de un usuario virtual:
+
+```powershell
+$runId = [guid]::NewGuid().ToString("N")
+k6 run -e BASE_URL=http://localhost:8080 -e RUN_ID=$runId -e MAX_VUS=1 -e STAGE_SECONDS=10 -e THINK_TIME_SECONDS=1 -e P95_MAX_MS=1500 -e CHECK_FAILURE_RATE_MAX=0.01 load\k6\telemetry.js
+```
+
+El escenario empieza con 1 usuario virtual, sube progresivamente por escalones de 5, 10, 20, 50, 100, 200, 500 y 1000 (omitiendo los que superen `MAX_VUS`) y mantiene el máximo configurado durante una etapa final. `STAGE_SECONDS` configura la duración de cada escalón y de esa etapa final; no representa una tasa de eventos por segundo. Cada VU envía una solicitud y espera `THINK_TIME_SECONDS` antes de la siguiente. Empieza con `MAX_VUS=1` y aumenta el máximo gradualmente, usando un `RUN_ID` nuevo por ejecución. El umbral exige al menos un POST aceptado para evitar que una ejecución sin iteraciones se considere válida.
+
+`RUN_ID` es obligatorio y se incorpora al prefijo `vehicleId` (`k6-<RUN_ID>-<VU>`), de modo que cada ejecución tenga vehículos identificables y cada VU use un ID distinto. Cada solicitud genera un `eventId` UUID nuevo. Los parámetros admiten estos valores predeterminados: `BASE_URL=http://localhost:8080`, `MAX_VUS=1`, `STAGE_SECONDS=10`, `THINK_TIME_SECONDS=1`, `P95_MAX_MS=1500` y `CHECK_FAILURE_RATE_MAX=0.01`. k6 registra la duración HTTP (`http_req_duration`), la tasa de checks y los contadores `telemetry_posts_accepted` y `telemetry_http_errors`. La prueba falla si el p95 supera `P95_MAX_MS` o la tasa de checks fallidos supera `CHECK_FAILURE_RATE_MAX`; son umbrales iniciales configurables, no garantías de rendimiento.
+
+Un `202 Accepted` confirma que Kafka recibió la publicación, no que el consumidor ya haya persistido la fila en PostgreSQL. Tras permitir que el consumidor drene los eventos, contrasta `telemetry_posts_accepted` del resumen de k6 con las filas de esa ejecución (conserva `$runId` en la misma sesión PowerShell):
+
+```powershell
+docker compose exec db psql -U fleet -d fleet -c "SELECT count(*) AS persisted_events FROM telemetry_events WHERE vehicle_id LIKE 'k6-$runId-%';"
+```
+
+La consulta no elimina ni modifica registros. Si los conteos difieren, revisa el tiempo de drenaje y los logs del consumidor; no interpretes el resultado HTTP por sí solo como confirmación de persistencia.
+
 ### Consultar el estado actual de un vehículo
 
 `GET /api/vehicles/{vehicleId}/state` devuelve `200 OK` con el ID del evento, vehículo, latitud, longitud, velocidad en km/h (o `null` si no estaba disponible) y timestamp del evento de telemetría más reciente según `event_timestamp` (no el orden de inserción). Los resultados del historial que usa el agente de IA incluyen también `speed`. Si no hay eventos para el vehículo, devuelve `404 Not Found`.
@@ -90,7 +111,7 @@ Las fechas se resuelven en el backend, nunca por el modelo: `today` y `yesterday
 
 El tamaño máximo de página se configura con `AI_HISTORY_MAX_RESULTS` (predeterminado `100`, rango `1`–`1000`); el offset está acotado a `100000`. El índice `(vehicle_id, event_timestamp, event_id)` soporta estas consultas. Una pregunta sin periodo para conteos, historial o extremos debe solicitar una aclaración; no se interpreta como consulta de todo el histórico.
 
-La integración usa `RestClient` y el endpoint Groq compatible con Chat Completions, sin añadir otra dependencia. La configuración canónica es `GROQ_API_KEY`, `GROQ_MODEL` y `GROQ_BASE_URL`. Los valores predeterminados son `https://api.groq.com/openai/v1` y `openai/gpt-oss-20b`. Para realizar consultas, configura en la sesión de PowerShell:
+La integración usa `RestClient` y el endpoint Groq compatible con Chat Completions; `resilience4j-circuitbreaker` protege la llamada HTTP saliente. La configuración canónica es `GROQ_API_KEY`, `GROQ_MODEL` y `GROQ_BASE_URL`. Los valores predeterminados son `https://api.groq.com/openai/v1` y `openai/gpt-oss-20b`. Para realizar consultas, configura en la sesión de PowerShell:
 
 ```powershell
 $env:GROQ_API_KEY = "TU_CLAVE_DE_GROQ"
@@ -99,6 +120,8 @@ $env:GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 ```
 
 Por compatibilidad, `OPENAI_API_KEY`, `OPENAI_MODEL` y `OPENAI_BASE_URL` se mantienen como aliases heredados: cada variable `GROQ_*` tiene prioridad sobre su alias `OPENAI_*`. Si no se define URL/modelo, se usan los valores predeterminados Groq anteriores. `GROQ_API_KEY` (o el alias heredado) se lee solo desde el entorno, no se registra y no es necesaria para arrancar la aplicación; el log de inicio informa únicamente el host, modelo y si hay una clave configurada. Docker Compose no ejecuta el backend, así que al arrancarlo desde el host debes definir estas variables en la misma sesión de PowerShell. Las pruebas usan claves ficticias/mocks y no requieren credenciales reales. La conexión tiene timeout de 3 segundos y la respuesta de 20 segundos. El agente realiza como máximo dos llamadas al proveedor por pregunta y ejecuta como máximo una invocación de herramienta por turno.
+
+Las solicitudes HTTP salientes a Groq están protegidas por el Circuit Breaker `groq` de Resilience4j. Sus valores configurables son `AI_GROQ_CB_SLIDING_WINDOW_SIZE` (10), `AI_GROQ_CB_MINIMUM_NUMBER_OF_CALLS` (5), `AI_GROQ_CB_FAILURE_RATE_THRESHOLD` (50 %), `AI_GROQ_CB_WAIT_DURATION_IN_OPEN_STATE_SECONDS` (15), `AI_GROQ_CB_PERMITTED_CALLS_IN_HALF_OPEN_STATE` (2) y `AI_GROQ_CB_AUTOMATIC_TRANSITION` (`false`). Cuenta como fallo solamente un timeout/error de acceso, una respuesta HTTP 5xx o una respuesta remota malformada. Las respuestas 4xx, incluida la 429, y cualquier excepción que no sea de comunicación transitoria se ignoran en las métricas (no cuentan como éxito ni como fallo); ausencia de clave, validación, herramientas y consultas de PostgreSQL quedan fuera de la operación protegida. Las respuestas 4xx mantienen el error público actual `503 AI_PROVIDER_UNAVAILABLE`, igual que el rechazo por circuito abierto. No se realizan reintentos automáticos y los timeouts existentes no cambian.
 
 Los esquemas de las herramientas no fuerzan `strict` y permiten omitir los límites `from` y `to` cuando no se consulta un periodo explícito; el backend trata su ausencia como nulo y valida el periodo antes de consultar. Esto evita que Groq rechace llamadas de historial reciente con `tool_use_failed` por omitir esos dos argumentos opcionales. Las respuestas de herramientas en el transcript incluyen `tool_call_id` y `name`, además del rol y el resultado.
 

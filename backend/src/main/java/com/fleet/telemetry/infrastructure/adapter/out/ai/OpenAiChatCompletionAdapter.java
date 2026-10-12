@@ -10,6 +10,8 @@ import com.fleet.telemetry.application.port.out.AiChatCompletionClient.ToolCall;
 import com.fleet.telemetry.application.port.out.AiChatCompletionClient.ToolDefinition;
 import com.fleet.telemetry.application.usecase.AiProviderUnavailableException;
 import com.fleet.telemetry.infrastructure.adapter.in.web.AiRequestCorrelationFilter;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -21,6 +23,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
+import org.springframework.web.client.ResourceAccessException;
 
 import java.time.Duration;
 import java.net.URI;
@@ -38,12 +41,14 @@ public class OpenAiChatCompletionAdapter implements AiChatCompletionClient {
 	private final String model;
 	private final String apiKey;
 	private final String providerHost;
+	private final CircuitBreaker circuitBreaker;
 
 	@Autowired
 	public OpenAiChatCompletionAdapter(
 			@Value("${app.ai.base-url:https://api.groq.com/openai/v1}") String baseUrl,
 			@Value("${app.ai.model:openai/gpt-oss-20b}") String model,
-			@Value("${GROQ_API_KEY:${OPENAI_API_KEY:}}") String apiKey) {
+			@Value("${GROQ_API_KEY:${OPENAI_API_KEY:}}") String apiKey,
+			CircuitBreaker groqCircuitBreaker) {
 		SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
 		requestFactory.setConnectTimeout(Duration.ofSeconds(3));
 		requestFactory.setReadTimeout(Duration.ofSeconds(20));
@@ -53,6 +58,7 @@ public class OpenAiChatCompletionAdapter implements AiChatCompletionClient {
 				.build();
 		this.model = model;
 		this.apiKey = apiKey;
+		this.circuitBreaker = groqCircuitBreaker;
 		this.providerHost = URI.create(baseUrl).getHost();
 		logger.info(
 				"AI provider configured: host={}, model={}, apiKeyConfigured={}",
@@ -65,10 +71,19 @@ public class OpenAiChatCompletionAdapter implements AiChatCompletionClient {
 			RestClient restClient,
 			String model,
 			String apiKey) {
+		this(restClient, model, apiKey, CircuitBreaker.ofDefaults("groq-test"));
+	}
+
+	OpenAiChatCompletionAdapter(
+			RestClient restClient,
+			String model,
+			String apiKey,
+			CircuitBreaker circuitBreaker) {
 		this.restClient = restClient;
 		this.model = model;
 		this.apiKey = apiKey;
 		this.providerHost = "configured-provider";
+		this.circuitBreaker = circuitBreaker;
 	}
 
 	@Override
@@ -90,46 +105,28 @@ public class OpenAiChatCompletionAdapter implements AiChatCompletionClient {
 				model,
 				callStage);
 		try {
-			String responseBody = restClient.post()
-					.uri("/chat/completions")
-					.contentType(MediaType.APPLICATION_JSON)
-					.headers(headers -> headers.setBearerAuth(apiKey))
-					.body(requestBody(messages, tools))
-					.retrieve()
-					.body(String.class);
+			Map<String, Object> body = requestBody(messages, tools);
+			Completion completion = circuitBreaker.executeSupplier(
+					() -> requestCompletion(body, correlationId, callStage));
 			httpStatus = "200";
-			JsonNode response = objectMapper.readTree(responseBody);
-			Completion completion = parseCompletion(response);
 			outcome = "success";
 			return completion;
-		} catch (RestClientResponseException exception) {
+		} catch (CallNotPermittedException exception) {
+			outcome = "circuit_open";
+			throw new AiProviderUnavailableException(
+					"No fue posible completar la solicitud al proveedor de IA.", exception);
+		} catch (GroqTransientFailureException exception) {
+			outcome = "provider_unavailable";
+			if (exception.getCause() instanceof RestClientResponseException responseException) {
+				httpStatus = Integer.toString(responseException.getStatusCode().value());
+			}
+			throw new AiProviderUnavailableException(exception.getMessage(), exception.getCause());
+		} catch (AiProviderUnavailableException exception) {
 			outcome = "provider_http_error";
-			httpStatus = Integer.toString(exception.getStatusCode().value());
-			logProviderResponseFailure(exception, correlationId, callStage);
-			throw new AiProviderUnavailableException(
-					"No fue posible completar la solicitud al proveedor de IA.", exception);
-		} catch (RestClientException exception) {
-			outcome = "transport_error";
-			logger.warn(
-					"AI provider request failed: correlationId={}, provider={}, model={}, stage={}, exception={}",
-					correlationId,
-					providerHost,
-					model,
-					callStage,
-					exception.getClass().getSimpleName());
-			throw new AiProviderUnavailableException(
-					"No fue posible completar la solicitud al proveedor de IA.", exception);
-		} catch (JsonProcessingException exception) {
-			outcome = "invalid_response";
-			logger.warn(
-					"AI provider returned an invalid response: correlationId={}, provider={}, model={}, stage={}, exception={}",
-					correlationId,
-					providerHost,
-					model,
-					callStage,
-					exception.getClass().getSimpleName());
-			throw new AiProviderUnavailableException(
-					"El proveedor de IA devolvió una respuesta inválida.", exception);
+			if (exception.getCause() instanceof RestClientResponseException responseException) {
+				httpStatus = Integer.toString(responseException.getStatusCode().value());
+			}
+			throw exception;
 		} finally {
 			logger.info(
 					"AI provider request completed: correlationId={}, provider={}, model={}, stage={}, httpStatus={}, durationMs={}, outcome={}",
@@ -141,6 +138,62 @@ public class OpenAiChatCompletionAdapter implements AiChatCompletionClient {
 					Duration.ofNanos(System.nanoTime() - startedAt).toMillis(),
 					outcome);
 		}
+	}
+
+	private Completion requestCompletion(
+			Map<String, Object> body,
+			String correlationId,
+			String callStage) {
+		try {
+			String responseBody = restClient.post()
+					.uri("/chat/completions")
+					.contentType(MediaType.APPLICATION_JSON)
+					.headers(headers -> headers.setBearerAuth(apiKey))
+					.body(body)
+					.retrieve()
+					.body(String.class);
+			JsonNode response = objectMapper.readTree(responseBody);
+			return parseCompletion(response);
+		} catch (RestClientResponseException exception) {
+			logProviderResponseFailure(exception, correlationId, callStage);
+			if (exception.getStatusCode().is5xxServerError()) {
+				throw new GroqTransientFailureException(
+						"No fue posible completar la solicitud al proveedor de IA.", exception);
+			}
+			throw new AiProviderUnavailableException(
+					"No fue posible completar la solicitud al proveedor de IA.", exception);
+		} catch (ResourceAccessException exception) {
+			logTransportFailure(exception, correlationId, callStage);
+			throw new GroqTransientFailureException(
+					"No fue posible completar la solicitud al proveedor de IA.", exception);
+		} catch (RestClientException exception) {
+			logTransportFailure(exception, correlationId, callStage);
+			throw new AiProviderUnavailableException(
+					"No fue posible completar la solicitud al proveedor de IA.", exception);
+		} catch (JsonProcessingException exception) {
+			logger.warn(
+					"AI provider returned an invalid response: correlationId={}, provider={}, model={}, stage={}, exception={}",
+					correlationId,
+					providerHost,
+					model,
+					callStage,
+					exception.getClass().getSimpleName());
+			throw new GroqTransientFailureException(
+					"El proveedor de IA devolvió una respuesta inválida.", exception);
+		}
+	}
+
+	private void logTransportFailure(
+			RestClientException exception,
+			String correlationId,
+			String callStage) {
+		logger.warn(
+				"AI provider request failed: correlationId={}, provider={}, model={}, stage={}, exception={}",
+				correlationId,
+				providerHost,
+				model,
+				callStage,
+				exception.getClass().getSimpleName());
 	}
 
 	private void logProviderResponseFailure(
