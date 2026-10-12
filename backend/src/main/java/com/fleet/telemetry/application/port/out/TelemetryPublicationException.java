@@ -1,4 +1,4 @@
-package com.fleet.telemetry.infrastructure.adapter.out.kafka;
+package com.fleet.telemetry.application.port.out;
 
 public class TelemetryPublicationException extends RuntimeException {
 

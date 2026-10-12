@@ -1,5 +1,6 @@
 package com.fleet.telemetry.infrastructure.adapter.out.kafka;
 
+import com.fleet.telemetry.application.port.out.TelemetryPublicationException;
 import com.fleet.telemetry.domain.model.TelemetryEvent;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.KafkaException;
